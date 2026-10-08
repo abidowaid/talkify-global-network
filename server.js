@@ -1,112 +1,193 @@
-const express = require("express");
-const cors = require("cors");
-const helmet = require("helmet");
-const cookieParser = require("cookie-parser");
-const bcrypt = require("bcryptjs");
-const jwt = require("jsonwebtoken");
-const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { Pool } = require("pg");
+'use strict';
+
+/*
+ * Talkify Global Network
+ * Production-ready backend foundation
+ *
+ * Important:
+ * - No localStorage/sessionStorage/IndexedDB for account data.
+ * - Database is PostgreSQL/Supabase.
+ * - Frontend is never trusted for balance, KYC, payment or permissions.
+ * - Real OTP/payment/telephony/SMS providers must be connected before production use.
+ */
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const cookieParser = require('cookie-parser');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
 
 const app = express();
 
-const PORT = process.env.PORT || 10000;
-const NODE_ENV = process.env.NODE_ENV || "development";
+/* =========================================================
+   ENVIRONMENT
+========================================================= */
 
-const DATABASE_URL = process.env.DATABASE_URL;
-const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_IN_PRODUCTION";
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "";
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+const PORT = Number(process.env.PORT || 10000);
+
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const JWT_SECRET = process.env.JWT_SECRET || '';
+
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || '';
+
+const COOKIE_NAME = 'talkify_session';
+
+const REQUEST_TIMEOUT_MS = 15000;
+const DB_CONNECT_TIMEOUT_MS = 8000;
+
+/* =========================================================
+   BASIC VALIDATION
+========================================================= */
 
 if (!DATABASE_URL) {
-  console.error("ERROR: DATABASE_URL is not configured.");
+  console.error('WARNING: DATABASE_URL is not configured.');
+  console.error('The server will start, but database-dependent APIs will return 503.');
+}
+
+if (IS_PRODUCTION && !JWT_SECRET) {
+  console.error('ERROR: JWT_SECRET is required in production.');
   process.exit(1);
 }
 
-if (
-  NODE_ENV === "production" &&
-  (!process.env.JWT_SECRET ||
-    process.env.JWT_SECRET === "CHANGE_THIS_IN_PRODUCTION")
-) {
-  console.error("ERROR: A strong JWT_SECRET is required in production.");
-  process.exit(1);
-}
+const EFFECTIVE_JWT_SECRET =
+  JWT_SECRET ||
+  crypto.randomBytes(48).toString('hex');
 
 /* =========================================================
    DATABASE
 ========================================================= */
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  },
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
+let pool = null;
+let dbReady = false;
+let dbConnecting = false;
 
-/* =========================================================
-   SECURITY / CORS
-========================================================= */
-
-app.disable("x-powered-by");
-
-app.use(
-  helmet({
-    crossOriginResourcePolicy: false
-  })
-);
-
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-app.use(cookieParser());
-
-const allowedOrigins = FRONTEND_ORIGIN
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
-
-const corsOptions = {
-  credentials: true,
-  origin: function (origin, callback) {
-    // Development: allow SPCK preview and local testing.
-    if (NODE_ENV !== "production") {
-      if (
-        !origin ||
-        origin === "null" ||
-        origin.startsWith("http://localhost") ||
-        origin.startsWith("http://127.0.0.1") ||
-        origin.startsWith("https://localhost") ||
-        origin.startsWith("https://127.0.0.1")
-      ) {
-        return callback(null, true);
-      }
-
-      return callback(null, true);
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: DB_CONNECT_TIMEOUT_MS,
+    ssl: {
+      rejectUnauthorized: false
     }
+  });
 
-    // Production: only explicitly configured origins.
-    if (!origin) return callback(null, true);
-
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    return callback(new Error("CORS origin not allowed"));
-  }
-};
-
-app.use(cors(corsOptions));
+  pool.on('error', (err) => {
+    dbReady = false;
+    console.error('[DATABASE POOL ERROR]', err.message);
+  });
+}
 
 /* =========================================================
    REQUEST ID
 ========================================================= */
 
-app.use((req, res, next) => {
-  const requestId = crypto.randomUUID();
+function requestId() {
+  return crypto.randomUUID();
+}
 
-  req.requestId = requestId;
-  res.setHeader("X-Request-ID", requestId);
+app.use((req, res, next) => {
+  req.requestId = requestId();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
+
+/* =========================================================
+   SECURITY
+========================================================= */
+
+app.disable('x-powered-by');
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: 'cross-origin'
+    }
+  })
+);
+
+app.use(
+  express.json({
+    limit: '15mb'
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: '15mb'
+  })
+);
+
+app.use(cookieParser());
+
+/* =========================================================
+   CORS
+========================================================= */
+
+const developmentOrigins = [
+  'http://localhost',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173'
+];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+
+  if (!IS_PRODUCTION) {
+    return true;
+  }
+
+  if (!FRONTEND_ORIGIN) {
+    return false;
+  }
+
+  return origin === FRONTEND_ORIGIN;
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('CORS origin not allowed'));
+      }
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-Request-ID'
+    ]
+  })
+);
+
+/* =========================================================
+   TIMEOUT
+========================================================= */
+
+app.use((req, res, next) => {
+  res.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    if (!res.headersSent) {
+      res.status(408).json({
+        ok: false,
+        error: 'Request timeout',
+        requestId: req.requestId
+      });
+    }
+  });
 
   next();
 });
@@ -129,7 +210,7 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     ok: false,
-    error: "Too many authentication attempts. Please try again later."
+    error: 'Too many authentication requests. Please try again later.'
   }
 });
 
@@ -139,1329 +220,1080 @@ app.use(generalLimiter);
    HELPERS
 ========================================================= */
 
-function sendError(res, status, message, extra = {}) {
+function jsonError(res, status, message, extra = {}) {
   return res.status(status).json({
     ok: false,
     error: message,
-    requestId: res.getHeader("X-Request-ID"),
     ...extra
   });
 }
 
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, {
-    expiresIn: "7d"
-  });
-}
-
-function verifyToken(token) {
-  return jwt.verify(token, JWT_SECRET);
-}
-
-function setAuthCookie(res, token) {
-  res.cookie("talkify_session", token, {
-    httpOnly: true,
-    secure: NODE_ENV === "production",
-    sameSite: NODE_ENV === "production" ? "none" : "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    path: "/"
-  });
-}
-
-function clearAuthCookie(res) {
-  res.clearCookie("talkify_session", {
-    httpOnly: true,
-    secure: NODE_ENV === "production",
-    sameSite: NODE_ENV === "production" ? "none" : "lax",
-    path: "/"
-  });
-}
-
-function getTokenFromRequest(req) {
-  if (req.cookies && req.cookies.talkify_session) {
-    return req.cookies.talkify_session;
-  }
-
-  const auth = req.headers.authorization || "";
-
-  if (auth.startsWith("Bearer ")) {
-    return auth.substring(7);
-  }
-
-  return null;
-}
-
-function requireAuth(req, res, next) {
-  try {
-    const token = getTokenFromRequest(req);
-
-    if (!token) {
-      return sendError(res, 401, "Authentication required.");
-    }
-
-    const payload = verifyToken(token);
-
-    req.auth = payload;
-
-    next();
-  } catch (error) {
-    return sendError(res, 401, "Invalid or expired session.");
-  }
-}
-
-function requireMasterAdmin(req, res, next) {
-  if (!req.auth || req.auth.type !== "master_admin") {
-    return sendError(res, 403, "Master Admin access required.");
+function requireDatabase(req, res, next) {
+  if (!pool || !dbReady) {
+    return jsonError(
+      res,
+      503,
+      'Database is not ready. Please try again shortly.'
+    );
   }
 
   next();
 }
 
-function normalizePhone(phone) {
-  return String(phone || "")
-    .trim()
-    .replace(/[^\d+]/g, "");
+function asyncHandler(fn) {
+  return function wrappedHandler(req, res, next) {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
-function generateRegistrationId() {
-  return (
-    "REG-" +
-    Date.now().toString(36).toUpperCase() +
-    "-" +
-    crypto.randomBytes(3).toString("hex").toUpperCase()
-  );
+function normalizePhone(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[^\d+]/g, '');
+}
+
+function normalizeEmail(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase();
+}
+
+function makeNetworkSuffix() {
+  return String(
+    crypto.randomInt(0, 100000000)
+  ).padStart(8, '0');
+}
+
+function createNetworkNumber(countryDigits) {
+  const digits = String(countryDigits || '').replace(/\D/g, '');
+
+  if (!digits) {
+    throw new Error('Invalid country digits');
+  }
+
+  const prefix = digits + '22222';
+
+  if (prefix.length >= 16) {
+    throw new Error('Country prefix is too long');
+  }
+
+  const suffixLength = 16 - prefix.length;
+
+  let suffix = '';
+
+  for (let i = 0; i < suffixLength; i++) {
+    suffix += String(crypto.randomInt(0, 10));
+  }
+
+  return prefix + suffix;
 }
 
 /* =========================================================
-   AUDIT LOG
+   JWT
 ========================================================= */
 
-async function writeAudit({
-  adminId = null,
-  action,
-  targetType = null,
-  targetId = null,
-  details = {}
-}) {
-  try {
-    await pool.query(
-      `
-      INSERT INTO audit_logs
-      (
-        admin_id,
-        action,
-        target_type,
-        target_id,
-        details,
-        created_at
-      )
-      VALUES ($1, $2, $3, $4, $5, NOW())
-      `,
-      [
-        adminId,
-        action,
-        targetType,
-        targetId,
-        JSON.stringify(details)
-      ]
-    );
-  } catch (error) {
-    console.error("Audit log error:", error.message);
+function signToken(payload) {
+  return jwt.sign(payload, EFFECTIVE_JWT_SECRET, {
+    expiresIn: '7d',
+    issuer: 'talkify-global-network'
+  });
+}
+
+function verifyToken(token) {
+  return jwt.verify(token, EFFECTIVE_JWT_SECRET, {
+    issuer: 'talkify-global-network'
+  });
+}
+
+function getTokenFromRequest(req) {
+  if (req.cookies && req.cookies[COOKIE_NAME]) {
+    return req.cookies[COOKIE_NAME];
   }
+
+  const header = req.headers.authorization || '';
+
+  if (header.startsWith('Bearer ')) {
+    return header.slice(7).trim();
+  }
+
+  return null;
+}
+
+function setSessionCookie(res, token) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: IS_PRODUCTION ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/'
+  });
+}
+
+function clearSessionCookie(res) {
+  res.clearCookie(COOKIE_NAME, {
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: IS_PRODUCTION ? 'none' : 'lax',
+    path: '/'
+  });
+}
+
+/* =========================================================
+   AUTH MIDDLEWARE
+========================================================= */
+
+function requireAuth(req, res, next) {
+  const token = getTokenFromRequest(req);
+
+  if (!token) {
+    return jsonError(res, 401, 'Authentication required.');
+  }
+
+  try {
+    const decoded = verifyToken(token);
+
+    req.auth = decoded;
+
+    next();
+  } catch (error) {
+    return jsonError(res, 401, 'Invalid or expired session.');
+  }
+}
+
+function requireMasterAdmin(req, res, next) {
+  if (!req.auth || req.auth.role !== 'master_admin') {
+    return jsonError(res, 403, 'Master Admin access required.');
+  }
+
+  next();
+}
+
+/* =========================================================
+   DATABASE CONNECTION
+========================================================= */
+
+async function checkDatabase() {
+  if (!pool) {
+    dbReady = false;
+    return false;
+  }
+
+  if (dbConnecting) {
+    return dbReady;
+  }
+
+  dbConnecting = true;
+
+  try {
+    const client = await pool.connect();
+
+    try {
+      await client.query('SELECT 1');
+      dbReady = true;
+
+      console.log('[DATABASE] Connected successfully.');
+
+      return true;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    dbReady = false;
+
+    console.error(
+      '[DATABASE] Connection failed:',
+      error.message
+    );
+
+    return false;
+  } finally {
+    dbConnecting = false;
+  }
+}
+
+/*
+ * Retry database connection in the background.
+ * This NEVER blocks app.listen().
+ */
+function startDatabaseMonitor() {
+  if (!pool) {
+    console.log(
+      '[DATABASE] No DATABASE_URL configured. Database APIs are disabled.'
+    );
+
+    return;
+  }
+
+  checkDatabase();
+
+  setInterval(() => {
+    if (!dbReady) {
+      checkDatabase();
+    }
+  }, 10000).unref();
 }
 
 /* =========================================================
    HEALTH
 ========================================================= */
 
-app.get("/api/health", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW() AS db_time");
+app.get('/api/health', asyncHandler(async (req, res) => {
+  let database = 'not_configured';
 
-    return res.json({
-      ok: true,
-      service: "Talkify Global Network Backend",
-      time: new Date().toISOString(),
-      environment: NODE_ENV,
-      database: "connected",
-      dbTime: result.rows[0].db_time,
-      requestId: req.requestId
-    });
-  } catch (error) {
-    return res.status(503).json({
-      ok: false,
-      service: "Talkify Global Network Backend",
-      time: new Date().toISOString(),
-      environment: NODE_ENV,
-      database: "error",
-      error: "Database connection failed.",
-      requestId: req.requestId
-    });
+  if (pool) {
+    database = dbReady ? 'connected' : 'disconnected';
   }
-});
+
+  res.json({
+    ok: true,
+    service: 'Talkify Global Network Backend',
+    time: new Date().toISOString(),
+    environment: NODE_ENV,
+    database,
+    requestId: req.requestId
+  });
+}));
+
+app.get('/api/health/db', requireDatabase, asyncHandler(async (req, res) => {
+  const result = await pool.query('SELECT NOW() AS now');
+
+  res.json({
+    ok: true,
+    database: 'connected',
+    time: result.rows[0].now,
+    requestId: req.requestId
+  });
+}));
 
 /* =========================================================
-   AUTH SESSION
+   AUTH - SESSION
 ========================================================= */
 
-app.get("/api/auth/session", async (req, res) => {
-  try {
-    const token = getTokenFromRequest(req);
+app.get('/api/auth/session', asyncHandler(async (req, res) => {
+  const token = getTokenFromRequest(req);
 
-    if (!token) {
-      return res.json({
-        ok: true,
-        authenticated: false
-      });
-    }
-
-    const payload = verifyToken(token);
-
-    if (payload.type === "master_admin") {
-      const result = await pool.query(
-        `
-        SELECT id, username, display_name, is_active
-        FROM master_admins
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [payload.id]
-      );
-
-      if (!result.rows.length || !result.rows[0].is_active) {
-        clearAuthCookie(res);
-
-        return res.json({
-          ok: true,
-          authenticated: false
-        });
-      }
-
-      return res.json({
-        ok: true,
-        authenticated: true,
-        type: "master_admin",
-        user: result.rows[0]
-      });
-    }
-
-    if (payload.type === "user") {
-      const result = await pool.query(
-        `
-        SELECT
-          id,
-          phone,
-          network_number,
-          full_name,
-          kyc_status,
-          is_active,
-          created_at
-        FROM users
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [payload.id]
-      );
-
-      if (!result.rows.length || !result.rows[0].is_active) {
-        clearAuthCookie();
-
-        return res.json({
-          ok: true,
-          authenticated: false
-        });
-      }
-
-      return res.json({
-        ok: true,
-        authenticated: true,
-        type: "user",
-        user: result.rows[0]
-      });
-    }
-
-    clearAuthCookie();
-
-    return res.json({
-      ok: true,
-      authenticated: false
-    });
-  } catch (error) {
-    clearAuthCookie();
-
+  if (!token) {
     return res.json({
       ok: true,
       authenticated: false
     });
   }
-});
+
+  try {
+    const decoded = verifyToken(token);
+
+    return res.json({
+      ok: true,
+      authenticated: true,
+      user: {
+        id: decoded.sub,
+        role: decoded.role,
+        networkNumber: decoded.networkNumber || null
+      }
+    });
+  } catch (error) {
+    return res.json({
+      ok: true,
+      authenticated: false
+    });
+  }
+}));
 
 /* =========================================================
-   MASTER ADMIN SETUP
+   MASTER ADMIN - SETUP
 ========================================================= */
 
 app.post(
-  "/api/admin/setup",
+  '/api/admin/setup',
   authLimiter,
-  async (req, res) => {
-    try {
-      const { username, password, displayName } = req.body;
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const {
+      password,
+      email = null,
+      name = 'Master Admin'
+    } = req.body || {};
 
-      if (!username || !password) {
-        return sendError(
-          res,
-          400,
-          "Username and password are required."
-        );
-      }
-
-      if (String(password).length < 8) {
-        return sendError(
-          res,
-          400,
-          "Password must contain at least 8 characters."
-        );
-      }
-
-      const countResult = await pool.query(
-        `SELECT COUNT(*)::int AS count FROM master_admins`
-      );
-
-      if (countResult.rows[0].count > 0) {
-        return sendError(
-          res,
-          409,
-          "Master Admin setup has already been completed."
-        );
-      }
-
-      const passwordHash = await bcrypt.hash(password, 12);
-
-      const result = await pool.query(
-        `
-        INSERT INTO master_admins
-        (
-          username,
-          password_hash,
-          display_name,
-          is_active,
-          created_at,
-          updated_at
-        )
-        VALUES ($1, $2, $3, true, NOW(), NOW())
-        RETURNING id, username, display_name, is_active, created_at
-        `,
-        [
-          String(username).trim(),
-          passwordHash,
-          displayName || "Master Admin"
-        ]
-      );
-
-      await writeAudit({
-        adminId: result.rows[0].id,
-        action: "master_admin_setup",
-        targetType: "master_admin",
-        targetId: result.rows[0].id,
-        details: {
-          username: result.rows[0].username
-        }
-      });
-
-      return res.status(201).json({
-        ok: true,
-        message: "Master Admin setup completed.",
-        admin: result.rows[0]
-      });
-    } catch (error) {
-      console.error("Admin setup:", error);
-
-      if (error.code === "23505") {
-        return sendError(res, 409, "Username already exists.");
-      }
-
-      return sendError(
+    if (!password || String(password).length < 10) {
+      return jsonError(
         res,
-        500,
-        "Master Admin setup failed."
+        400,
+        'Password must contain at least 10 characters.'
       );
     }
-  }
+
+    const existing = await pool.query(
+      'SELECT id FROM master_admins LIMIT 1'
+    );
+
+    if (existing.rows.length > 0) {
+      return jsonError(
+        res,
+        409,
+        'Master Admin is already configured.'
+      );
+    }
+
+    const passwordHash = await bcrypt.hash(
+      String(password),
+      12
+    );
+
+    const result = await pool.query(
+      `
+      INSERT INTO master_admins
+        (name, email, password_hash, created_at)
+      VALUES
+        ($1, $2, $3, NOW())
+      RETURNING id, name, email, created_at
+      `,
+      [
+        String(name).trim(),
+        email ? normalizeEmail(email) : null,
+        passwordHash
+      ]
+    );
+
+    res.status(201).json({
+      ok: true,
+      message: 'Master Admin created successfully.',
+      admin: result.rows[0]
+    });
+  })
 );
 
 /* =========================================================
-   MASTER ADMIN LOGIN
+   MASTER ADMIN - LOGIN
 ========================================================= */
 
 app.post(
-  "/api/admin/login",
+  '/api/admin/login',
   authLimiter,
-  async (req, res) => {
-    try {
-      const { username, password } = req.body;
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const {
+      password,
+      email = null
+    } = req.body || {};
 
-      if (!username || !password) {
-        return sendError(
-          res,
-          400,
-          "Username and password are required."
-        );
-      }
+    if (!password) {
+      return jsonError(res, 400, 'Password is required.');
+    }
 
-      const result = await pool.query(
+    let result;
+
+    if (email) {
+      result = await pool.query(
         `
         SELECT *
         FROM master_admins
-        WHERE username = $1
+        WHERE LOWER(email) = LOWER($1)
         LIMIT 1
         `,
-        [String(username).trim()]
+        [normalizeEmail(email)]
       );
-
-      if (!result.rows.length) {
-        return sendError(res, 401, "Invalid username or password.");
-      }
-
-      const admin = result.rows[0];
-
-      if (!admin.is_active) {
-        return sendError(res, 403, "This admin account is disabled.");
-      }
-
-      const valid = await bcrypt.compare(
-        String(password),
-        admin.password_hash
-      );
-
-      if (!valid) {
-        return sendError(res, 401, "Invalid username or password.");
-      }
-
-      const token = signToken({
-        id: admin.id,
-        type: "master_admin",
-        username: admin.username
-      });
-
-      setAuthCookie(res, token);
-
-      await pool.query(
+    } else {
+      result = await pool.query(
         `
-        UPDATE master_admins
-        SET last_login_at = NOW(), updated_at = NOW()
-        WHERE id = $1
-        `,
-        [admin.id]
-      );
-
-      await writeAudit({
-        adminId: admin.id,
-        action: "master_admin_login",
-        targetType: "master_admin",
-        targetId: admin.id,
-        details: {}
-      });
-
-      return res.json({
-        ok: true,
-        authenticated: true,
-        type: "master_admin",
-        admin: {
-          id: admin.id,
-          username: admin.username,
-          display_name: admin.display_name
-        }
-      });
-    } catch (error) {
-      console.error("Admin login:", error);
-
-      return sendError(
-        res,
-        500,
-        "Login failed."
+        SELECT *
+        FROM master_admins
+        ORDER BY created_at ASC
+        LIMIT 1
+        `
       );
     }
-  }
+
+    if (!result.rows.length) {
+      return jsonError(
+        res,
+        401,
+        'Master Admin account not found.'
+      );
+    }
+
+    const admin = result.rows[0];
+
+    const valid = await bcrypt.compare(
+      String(password),
+      admin.password_hash
+    );
+
+    if (!valid) {
+      return jsonError(
+        res,
+        401,
+        'Invalid password.'
+      );
+    }
+
+    const token = signToken({
+      sub: String(admin.id),
+      role: 'master_admin',
+      name: admin.name
+    });
+
+    setSessionCookie(res, token);
+
+    await pool.query(
+      `
+      UPDATE master_admins
+      SET last_login_at = NOW()
+      WHERE id = $1
+      `,
+      [admin.id]
+    );
+
+    res.json({
+      ok: true,
+      message: 'Login successful.',
+      admin: {
+        id: admin.id,
+        name: admin.name,
+        email: admin.email
+      }
+    });
+  })
 );
 
 /* =========================================================
-   LOGOUT
+   MASTER ADMIN - LOGOUT
 ========================================================= */
 
-app.post("/api/auth/logout", requireAuth, async (req, res) => {
-  try {
-    if (req.auth && req.auth.type === "master_admin") {
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "logout",
-        targetType: "master_admin",
-        targetId: req.auth.id
-      });
-    }
+app.post('/api/admin/logout', (req, res) => {
+  clearSessionCookie(res);
 
-    clearAuthCookie(res);
+  res.json({
+    ok: true,
+    message: 'Logged out successfully.'
+  });
+});
 
-    return res.json({
-      ok: true,
-      message: "Logged out successfully."
-    });
-  } catch (error) {
-    clearAuthCookie(res);
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookie(res);
 
-    return res.json({
-      ok: true,
-      message: "Logged out successfully."
-    });
-  }
+  res.json({
+    ok: true,
+    message: 'Logged out successfully.'
+  });
 });
 
 /* =========================================================
-   CHANGE MASTER ADMIN PASSWORD
+   MASTER ADMIN - SESSION
 ========================================================= */
 
-app.post(
-  "/api/admin/change-password",
+app.get(
+  '/api/admin/session',
   requireAuth,
   requireMasterAdmin,
+  asyncHandler(async (req, res) => {
+    res.json({
+      ok: true,
+      authenticated: true,
+      admin: {
+        id: req.auth.sub,
+        role: req.auth.role,
+        name: req.auth.name || 'Master Admin'
+      }
+    });
+  })
+);
+
+/* =========================================================
+   MASTER ADMIN - CHANGE PASSWORD
+========================================================= */
+
+app.post(
+  '/api/admin/change-password',
   authLimiter,
-  async (req, res) => {
-    try {
-      const { currentPassword, newPassword } = req.body;
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const {
+      currentPassword,
+      newPassword
+    } = req.body || {};
 
-      if (!currentPassword || !newPassword) {
-        return sendError(
-          res,
-          400,
-          "Current password and new password are required."
-        );
-      }
-
-      if (String(newPassword).length < 8) {
-        return sendError(
-          res,
-          400,
-          "New password must contain at least 8 characters."
-        );
-      }
-
-      const result = await pool.query(
-        `
-        SELECT id, password_hash
-        FROM master_admins
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [req.auth.id]
-      );
-
-      if (!result.rows.length) {
-        return sendError(res, 404, "Admin account not found.");
-      }
-
-      const valid = await bcrypt.compare(
-        currentPassword,
-        result.rows[0].password_hash
-      );
-
-      if (!valid) {
-        return sendError(
-          res,
-          401,
-          "Current password is incorrect."
-        );
-      }
-
-      const passwordHash = await bcrypt.hash(newPassword, 12);
-
-      await pool.query(
-        `
-        UPDATE master_admins
-        SET password_hash = $1, updated_at = NOW()
-        WHERE id = $2
-        `,
-        [passwordHash, req.auth.id]
-      );
-
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "master_admin_password_changed",
-        targetType: "master_admin",
-        targetId: req.auth.id
-      });
-
-      return res.json({
-        ok: true,
-        message: "Password changed successfully."
-      });
-    } catch (error) {
-      console.error("Password change:", error);
-
-      return sendError(
+    if (!currentPassword || !newPassword) {
+      return jsonError(
         res,
-        500,
-        "Password change failed."
+        400,
+        'Current and new password are required.'
       );
     }
-  }
+
+    if (String(newPassword).length < 10) {
+      return jsonError(
+        res,
+        400,
+        'New password must contain at least 10 characters.'
+      );
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM master_admins
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [req.auth.sub]
+    );
+
+    if (!result.rows.length) {
+      return jsonError(
+        res,
+        404,
+        'Admin account not found.'
+      );
+    }
+
+    const admin = result.rows[0];
+
+    const valid = await bcrypt.compare(
+      String(currentPassword),
+      admin.password_hash
+    );
+
+    if (!valid) {
+      return jsonError(
+        res,
+        401,
+        'Current password is incorrect.'
+      );
+    }
+
+    const newHash = await bcrypt.hash(
+      String(newPassword),
+      12
+    );
+
+    await pool.query(
+      `
+      UPDATE master_admins
+      SET password_hash = $1
+      WHERE id = $2
+      `,
+      [
+        newHash,
+        req.auth.sub
+      ]
+    );
+
+    res.json({
+      ok: true,
+      message: 'Password changed successfully.'
+    });
+  })
 );
 
 /* =========================================================
-   FORGOT PASSWORD / 2FA
-   Real provider required — no fake success.
+   USER AUTH - SEND OTP
 ========================================================= */
 
 app.post(
-  "/api/admin/forgot-password",
+  '/api/auth/register/send-otp',
   authLimiter,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
+    const phone = normalizePhone(req.body?.phone);
+
+    if (!phone) {
+      return jsonError(res, 400, 'Phone number is required.');
+    }
+
+    /*
+     * Real SMS provider must be connected here.
+     * We deliberately do NOT fake OTP delivery.
+     */
     return res.status(501).json({
       ok: false,
-      error:
-        "Password recovery is not enabled yet. A verified email/SMS provider must be connected first."
+      error: 'OTP provider is not configured yet.',
+      code: 'OTP_PROVIDER_NOT_CONFIGURED'
     });
-  }
+  })
 );
 
 app.post(
-  "/api/admin/2fa/send",
+  '/api/auth/login/send-otp',
   authLimiter,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
+    const phone = normalizePhone(req.body?.phone);
+
+    if (!phone) {
+      return jsonError(res, 400, 'Phone number is required.');
+    }
+
     return res.status(501).json({
       ok: false,
-      error:
-        "2FA delivery is not enabled yet. A real OTP provider must be connected first."
+      error: 'OTP provider is not configured yet.',
+      code: 'OTP_PROVIDER_NOT_CONFIGURED'
     });
-  }
+  })
 );
 
 app.post(
-  "/api/admin/2fa/verify",
+  '/api/auth/register/verify-otp',
   authLimiter,
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     return res.status(501).json({
       ok: false,
-      error:
-        "2FA verification is not enabled yet. A real OTP provider must be connected first."
+      error: 'OTP provider is not configured yet.',
+      code: 'OTP_PROVIDER_NOT_CONFIGURED'
     });
-  }
+  })
+);
+
+app.post(
+  '/api/auth/login/verify-otp',
+  authLimiter,
+  asyncHandler(async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error: 'OTP provider is not configured yet.',
+      code: 'OTP_PROVIDER_NOT_CONFIGURED'
+    });
+  })
 );
 
 /* =========================================================
-   COUNTRIES
+   PROFILE
 ========================================================= */
 
-app.get("/api/config/countries", async (req, res) => {
-  try {
+app.get(
+  '/api/profile',
+  requireAuth,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
     const result = await pool.query(
       `
       SELECT
         id,
+        phone,
+        network_number,
+        full_name,
+        date_of_birth,
+        gender,
         country_code,
-        country_name,
-        dial_code,
-        primary_language,
-        enabled
+        status,
+        created_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [req.auth.sub]
+    );
+
+    if (!result.rows.length) {
+      return jsonError(
+        res,
+        404,
+        'User profile not found.'
+      );
+    }
+
+    res.json({
+      ok: true,
+      user: result.rows[0]
+    });
+  })
+);
+
+/* =========================================================
+   CONFIG - COUNTRIES
+========================================================= */
+
+app.get(
+  '/api/config/countries',
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
       FROM countries
-      WHERE enabled = true
-      ORDER BY country_name ASC
+      WHERE enabled = TRUE
+      ORDER BY name ASC
       `
     );
 
-    return res.json({
+    res.json({
       ok: true,
       countries: result.rows
     });
-  } catch (error) {
-    console.error("Countries:", error);
+  })
+);
 
-    return sendError(
-      res,
-      500,
-      "Unable to load countries."
+/* =========================================================
+   ADMIN - COUNTRIES
+========================================================= */
+
+app.get(
+  '/api/admin/countries',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM countries
+      ORDER BY name ASC
+      `
     );
-  }
-});
 
-app.get(
-  "/api/admin/countries",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT *
-        FROM countries
-        ORDER BY country_name ASC
-        `
-      );
-
-      return res.json({
-        ok: true,
-        countries: result.rows
-      });
-    } catch (error) {
-      return sendError(
-        res,
-        500,
-        "Unable to load countries."
-      );
-    }
-  }
+    res.json({
+      ok: true,
+      countries: result.rows
+    });
+  })
 );
 
 app.patch(
-  "/api/admin/countries/:id",
+  '/api/admin/countries/:id',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const { enabled } = req.body;
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const enabled = Boolean(req.body?.enabled);
 
-      if (typeof enabled !== "boolean") {
-        return sendError(
-          res,
-          400,
-          "enabled must be true or false."
-        );
-      }
+    const result = await pool.query(
+      `
+      UPDATE countries
+      SET enabled = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [
+        enabled,
+        req.params.id
+      ]
+    );
 
-      const result = await pool.query(
-        `
-        UPDATE countries
-        SET enabled = $1, updated_at = NOW()
-        WHERE id = $2
-        RETURNING *
-        `,
-        [enabled, req.params.id]
-      );
-
-      if (!result.rows.length) {
-        return sendError(res, 404, "Country not found.");
-      }
-
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "country_status_changed",
-        targetType: "country",
-        targetId: req.params.id,
-        details: { enabled }
-      });
-
-      return res.json({
-        ok: true,
-        country: result.rows[0]
-      });
-    } catch (error) {
-      return sendError(
+    if (!result.rows.length) {
+      return jsonError(
         res,
-        500,
-        "Unable to update country."
+        404,
+        'Country not found.'
       );
     }
-  }
+
+    res.json({
+      ok: true,
+      country: result.rows[0]
+    });
+  })
 );
 
 /* =========================================================
-   USER REGISTRATION OTP
-   Real SMS provider required.
+   KYC
 ========================================================= */
 
 app.post(
-  "/api/auth/register/send-otp",
-  authLimiter,
-  async (req, res) => {
+  '/api/kyc/face-match',
+  requireAuth,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    /*
+     * Real face-match provider must be connected.
+     * No fake green verification.
+     */
     return res.status(501).json({
       ok: false,
-      error:
-        "Registration OTP is not enabled yet. Connect a real SMS provider before sending OTPs."
+      error: 'Face verification provider is not configured yet.',
+      code: 'FACE_PROVIDER_NOT_CONFIGURED'
     });
-  }
+  })
 );
 
 app.post(
-  "/api/auth/register/verify-otp",
-  authLimiter,
-  async (req, res) => {
+  '/api/kyc/submit',
+  requireAuth,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const {
+      fullName,
+      dateOfBirth,
+      gender,
+      nid
+    } = req.body || {};
+
+    if (!fullName || !dateOfBirth || !gender || !nid) {
+      return jsonError(
+        res,
+        400,
+        'Required KYC information is missing.'
+      );
+    }
+
+    /*
+     * Actual image/object-storage upload and face verification
+     * must be connected before approval.
+     */
     return res.status(501).json({
       ok: false,
-      error:
-        "Registration OTP verification is not enabled yet. Connect a real SMS provider first."
+      error: 'KYC storage/verification provider is not configured yet.',
+      code: 'KYC_PROVIDER_NOT_CONFIGURED'
     });
-  }
+  })
 );
 
 /* =========================================================
-   USER LOGIN OTP
-========================================================= */
-
-app.post(
-  "/api/auth/login/send-otp",
-  authLimiter,
-  async (req, res) => {
-    return res.status(501).json({
-      ok: false,
-      error:
-        "Login OTP is not enabled yet. Connect a real SMS provider first."
-    });
-  }
-);
-
-app.post(
-  "/api/auth/login/verify-otp",
-  authLimiter,
-  async (req, res) => {
-    return res.status(501).json({
-      ok: false,
-      error:
-        "Login OTP verification is not enabled yet. Connect a real SMS provider first."
-    });
-  }
-);
-
-/* =========================================================
-   USER PROFILE
+   ADMIN - KYC LIST
 ========================================================= */
 
 app.get(
-  "/api/profile",
+  '/api/admin/kyc',
   requireAuth,
-  async (req, res) => {
-    try {
-      if (req.auth.type !== "user") {
-        return sendError(res, 403, "User access required.");
-      }
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT
+        k.*,
+        u.phone,
+        u.network_number
+      FROM kyc_records k
+      LEFT JOIN users u
+        ON u.id = k.user_id
+      ORDER BY k.created_at DESC
+      LIMIT 500
+      `
+    );
 
-      const result = await pool.query(
-        `
-        SELECT
-          id,
-          phone,
-          network_number,
-          full_name,
-          date_of_birth,
-          gender,
-          nid_number,
-          kyc_status,
-          created_at
-        FROM users
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [req.auth.id]
-      );
+    res.json({
+      ok: true,
+      kyc: result.rows
+    });
+  })
+);
 
-      if (!result.rows.length) {
-        return sendError(res, 404, "User not found.");
-      }
+/* =========================================================
+   ADMIN - KYC DETAIL
+========================================================= */
 
-      return res.json({
-        ok: true,
-        profile: result.rows[0]
-      });
-    } catch (error) {
-      return sendError(
+app.get(
+  '/api/admin/kyc/:id',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT
+        k.*,
+        u.phone,
+        u.network_number
+      FROM kyc_records k
+      LEFT JOIN users u
+        ON u.id = k.user_id
+      WHERE k.id = $1
+      LIMIT 1
+      `,
+      [req.params.id]
+    );
+
+    if (!result.rows.length) {
+      return jsonError(
         res,
-        500,
-        "Unable to load profile."
+        404,
+        'KYC record not found.'
       );
     }
-  }
-);
 
-/* =========================================================
-   KYC FACE MATCH
-   Real provider required.
-========================================================= */
-
-app.post(
-  "/api/kyc/face-match",
-  requireAuth,
-  async (req, res) => {
-    return res.status(501).json({
-      ok: false,
-      error:
-        "Face matching is not enabled yet. A real KYC/face verification provider must be connected."
+    res.json({
+      ok: true,
+      kyc: result.rows[0]
     });
-  }
+  })
 );
 
 /* =========================================================
-   KYC SUBMIT
+   ADMIN - KYC DECISION
 ========================================================= */
 
-app.post(
-  "/api/kyc/submit",
+app.patch(
+  '/api/admin/kyc/:id/decision',
   requireAuth,
-  async (req, res) => {
-    try {
-      if (req.auth.type !== "user") {
-        return sendError(res, 403, "User access required.");
-      }
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const status = String(
+      req.body?.status || ''
+    ).toLowerCase();
 
-      const {
-        fullName,
-        dateOfBirth,
-        gender,
-        nidNumber,
-        idFrontUrl,
-        idBackUrl,
-        selfieUrl
-      } = req.body;
+    const allowed = [
+      'approved',
+      'rejected',
+      'manual_review',
+      'pending'
+    ];
 
-      if (
-        !fullName ||
-        !dateOfBirth ||
-        !gender ||
-        !nidNumber
-      ) {
-        return sendError(
-          res,
-          400,
-          "Required KYC information is missing."
-        );
-      }
-
-      const userResult = await pool.query(
-        `
-        SELECT id
-        FROM users
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [req.auth.id]
+    if (!allowed.includes(status)) {
+      return jsonError(
+        res,
+        400,
+        'Invalid KYC status.'
       );
+    }
 
-      if (!userResult.rows.length) {
-        return sendError(res, 404, "User not found.");
-      }
+    const result = await pool.query(
+      `
+      UPDATE kyc_records
+      SET
+        status = $1,
+        reviewed_by = $2,
+        reviewed_at = NOW()
+      WHERE id = $3
+      RETURNING *
+      `,
+      [
+        status,
+        req.auth.sub,
+        req.params.id
+      ]
+    );
 
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          full_name = $1,
-          date_of_birth = $2,
-          gender = $3,
-          nid_number = $4,
-          kyc_status = 'Pending',
-          updated_at = NOW()
-        WHERE id = $5
-        `,
-        [
-          fullName,
-          dateOfBirth,
-          gender,
-          nidNumber,
-          req.auth.id
-        ]
+    if (!result.rows.length) {
+      return jsonError(
+        res,
+        404,
+        'KYC record not found.'
       );
+    }
 
-      const result = await pool.query(
-        `
-        INSERT INTO kyc_records
+    res.json({
+      ok: true,
+      kyc: result.rows[0]
+    });
+  })
+);
+
+/* =========================================================
+   ADMIN - USERS
+========================================================= */
+
+app.get(
+  '/api/admin/users',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const search = String(
+      req.query.search || ''
+    ).trim();
+
+    const country = String(
+      req.query.country || ''
+    ).trim();
+
+    const status = String(
+      req.query.status || ''
+    ).trim();
+
+    const values = [];
+    const conditions = [];
+
+    if (search) {
+      values.push(`%${search}%`);
+
+      conditions.push(`
         (
-          user_id,
-          id_front_url,
-          id_back_url,
-          selfie_url,
-          status,
-          created_at,
-          updated_at
+          full_name ILIKE $${values.length}
+          OR phone ILIKE $${values.length}
+          OR network_number ILIKE $${values.length}
         )
-        VALUES ($1, $2, $3, $4, 'Pending', NOW(), NOW())
-        RETURNING *
-        `,
-        [
-          req.auth.id,
-          idFrontUrl || null,
-          idBackUrl || null,
-          selfieUrl || null
-        ]
-      );
+      `);
+    }
 
-      return res.status(201).json({
-        ok: true,
-        message: "KYC submitted for review.",
-        kyc: result.rows[0]
-      });
-    } catch (error) {
-      console.error("KYC submit:", error);
+    if (country) {
+      values.push(country);
 
-      return sendError(
-        res,
-        500,
-        "KYC submission failed."
+      conditions.push(
+        `country_code = $${values.length}`
       );
     }
-  }
+
+    if (status) {
+      values.push(status);
+
+      conditions.push(
+        `status = $${values.length}`
+      );
+    }
+
+    const where = conditions.length
+      ? `WHERE ${conditions.join(' AND ')}`
+      : '';
+
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        phone,
+        network_number,
+        full_name,
+        date_of_birth,
+        gender,
+        country_code,
+        status,
+        created_at
+      FROM users
+      ${where}
+      ORDER BY created_at DESC
+      LIMIT 500
+      `,
+      values
+    );
+
+    res.json({
+      ok: true,
+      users: result.rows
+    });
+  })
 );
 
 /* =========================================================
-   ADMIN DASHBOARD SUMMARY
+   ADMIN - USER DETAIL
 ========================================================= */
 
 app.get(
-  "/api/admin/dashboard/summary",
+  '/api/admin/users/:id',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const users = await pool.query(
-        `SELECT COUNT(*)::int AS count FROM users`
-      );
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        phone,
+        network_number,
+        full_name,
+        date_of_birth,
+        gender,
+        country_code,
+        status,
+        created_at
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [req.params.id]
+    );
 
-      const pendingKyc = await pool.query(
-        `
-        SELECT COUNT(*)::int AS count
-        FROM kyc_records
-        WHERE status IN ('Pending', 'manual_review')
-        `
-      );
-
-      const walletBalance = await pool.query(
-        `
-        SELECT COALESCE(SUM(balance), 0) AS total
-        FROM wallets
-        `
-      );
-
-      const transactions = await pool.query(
-        `
-        SELECT
-          COUNT(*)::int AS count,
-          COALESCE(SUM(amount), 0) AS amount
-        FROM wallet_transactions
-        WHERE created_at >= CURRENT_DATE
-        `
-      );
-
-      return res.json({
-        ok: true,
-        metrics: {
-          totalUsers: users.rows[0].count,
-          onlineUsers: 0,
-          todayRecharge: Number(transactions.rows[0].amount || 0),
-          todaysCalls: 0,
-          totalWalletBalance: Number(
-            walletBalance.rows[0].total || 0
-          ),
-          callProviderCost: 0,
-          revenue: 0,
-          estimatedMargin: 0,
-          pendingTasks: pendingKyc.rows[0].count
-        }
-      });
-    } catch (error) {
-      console.error("Dashboard summary:", error);
-
-      return sendError(
+    if (!result.rows.length) {
+      return jsonError(
         res,
-        500,
-        "Unable to load dashboard summary."
+        404,
+        'User not found.'
       );
     }
-  }
-);
 
-/* =========================================================
-   USERS
-========================================================= */
-
-app.get(
-  "/api/admin/users",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const search = String(req.query.search || "").trim();
-      const status = String(req.query.status || "").trim();
-
-      const params = [];
-      const conditions = [];
-
-      if (search) {
-        params.push(`%${search}%`);
-
-        conditions.push(`
-          (
-            full_name ILIKE $${params.length}
-            OR phone ILIKE $${params.length}
-            OR network_number ILIKE $${params.length}
-            OR registration_id ILIKE $${params.length}
-          )
-        `);
-      }
-
-      if (status) {
-        params.push(status);
-
-        conditions.push(
-          `kyc_status = $${params.length}`
-        );
-      }
-
-      const where = conditions.length
-        ? `WHERE ${conditions.join(" AND ")}`
-        : "";
-
-      const result = await pool.query(
-        `
-        SELECT
-          id,
-          registration_id,
-          phone,
-          network_number,
-          full_name,
-          date_of_birth,
-          gender,
-          kyc_status,
-          is_active,
-          created_at
-        FROM users
-        ${where}
-        ORDER BY created_at DESC
-        LIMIT 200
-        `,
-        params
-      );
-
-      return res.json({
-        ok: true,
-        users: result.rows
-      });
-    } catch (error) {
-      console.error("Users:", error);
-
-      return sendError(
-        res,
-        500,
-        "Unable to load users."
-      );
-    }
-  }
-);
-
-/* =========================================================
-   USER DETAIL
-========================================================= */
-
-app.get(
-  "/api/admin/users/:id",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          u.*,
-          k.id AS kyc_record_id,
-          k.id_front_url,
-          k.id_back_url,
-          k.selfie_url,
-          k.face_match_status,
-          k.status AS kyc_record_status,
-          k.created_at AS kyc_created_at
-        FROM users u
-        LEFT JOIN LATERAL (
-          SELECT *
-          FROM kyc_records
-          WHERE user_id = u.id
-          ORDER BY created_at DESC
-          LIMIT 1
-        ) k ON true
-        WHERE u.id = $1
-        LIMIT 1
-        `,
-        [req.params.id]
-      );
-
-      if (!result.rows.length) {
-        return sendError(res, 404, "User not found.");
-      }
-
-      return res.json({
-        ok: true,
-        user: result.rows[0]
-      });
-    } catch (error) {
-      return sendError(
-        res,
-        500,
-        "Unable to load user."
-      );
-    }
-  }
-);
-
-/* =========================================================
-   KYC LIST
-========================================================= */
-
-app.get(
-  "/api/admin/kyc",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const status = String(req.query.status || "").trim();
-      const search = String(req.query.search || "").trim();
-
-      const params = [];
-      const conditions = [];
-
-      if (status) {
-        params.push(status);
-        conditions.push(`k.status = $${params.length}`);
-      }
-
-      if (search) {
-        params.push(`%${search}%`);
-
-        conditions.push(`
-          (
-            u.full_name ILIKE $${params.length}
-            OR u.phone ILIKE $${params.length}
-            OR u.network_number ILIKE $${params.length}
-            OR u.nid_number ILIKE $${params.length}
-          )
-        `);
-      }
-
-      const where = conditions.length
-        ? `WHERE ${conditions.join(" AND ")}`
-        : "";
-
-      const result = await pool.query(
-        `
-        SELECT
-          k.*,
-          u.full_name,
-          u.phone,
-          u.network_number,
-          u.date_of_birth,
-          u.gender,
-          u.nid_number,
-          u.registration_id
-        FROM kyc_records k
-        JOIN users u ON u.id = k.user_id
-        ${where}
-        ORDER BY k.created_at DESC
-        LIMIT 200
-        `,
-        params
-      );
-
-      return res.json({
-        ok: true,
-        records: result.rows
-      });
-    } catch (error) {
-      console.error("KYC:", error);
-
-      return sendError(
-        res,
-        500,
-        "Unable to load KYC records."
-      );
-    }
-  }
-);
-
-/* =========================================================
-   KYC DECISION
-========================================================= */
-
-app.patch(
-  "/api/admin/kyc/:id/decision",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const { status, notes } = req.body;
-
-      const allowed = [
-        "Pending",
-        "Approved",
-        "Rejected",
-        "manual_review"
-      ];
-
-      if (!allowed.includes(status)) {
-        return sendError(
-          res,
-          400,
-          "Invalid KYC status."
-        );
-      }
-
-      const kycResult = await pool.query(
-        `
-        UPDATE kyc_records
-        SET
-          status = $1,
-          review_notes = $2,
-          reviewed_by = $3,
-          reviewed_at = NOW(),
-          updated_at = NOW()
-        WHERE id = $4
-        RETURNING *
-        `,
-        [
-          status,
-          notes || null,
-          req.auth.id,
-          req.params.id
-        ]
-      );
-
-      if (!kycResult.rows.length) {
-        return sendError(
-          res,
-          404,
-          "KYC record not found."
-        );
-      }
-
-      const kyc = kycResult.rows[0];
-
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          kyc_status = $1,
-          updated_at = NOW()
-        WHERE id = $2
-        `,
-        [status, kyc.user_id]
-      );
-
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "kyc_decision",
-        targetType: "kyc",
-        targetId: req.params.id,
-        details: {
-          status,
-          notes: notes || null
-        }
-      });
-
-      return res.json({
-        ok: true,
-        kyc
-      });
-    } catch (error) {
-      console.error("KYC decision:", error);
-
-      return sendError(
-        res,
-        500,
-        "Unable to update KYC status."
-      );
-    }
-  }
+    res.json({
+      ok: true,
+      user: result.rows[0]
+    });
+  })
 );
 
 /* =========================================================
@@ -1469,129 +1301,138 @@ app.patch(
 ========================================================= */
 
 app.get(
-  "/api/admin/features",
+  '/api/config/features',
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM features
+      ORDER BY name ASC
+      `
+    );
+
+    res.json({
+      ok: true,
+      features: result.rows
+    });
+  })
+);
+
+app.get(
+  '/api/admin/features',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT *
-        FROM features
-        ORDER BY name ASC
-        `
-      );
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM features
+      ORDER BY name ASC
+      `
+    );
 
-      return res.json({
-        ok: true,
-        features: result.rows
-      });
-    } catch (error) {
-      return sendError(
-        res,
-        500,
-        "Unable to load features."
-      );
-    }
-  }
+    res.json({
+      ok: true,
+      features: result.rows
+    });
+  })
 );
 
 app.patch(
-  "/api/admin/features/:id",
+  '/api/admin/features/:id',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const { enabled } = req.body;
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const enabled = Boolean(req.body?.enabled);
 
-      if (typeof enabled !== "boolean") {
-        return sendError(
-          res,
-          400,
-          "enabled must be true or false."
-        );
-      }
+    const result = await pool.query(
+      `
+      UPDATE features
+      SET enabled = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [
+        enabled,
+        req.params.id
+      ]
+    );
 
-      const result = await pool.query(
-        `
-        UPDATE features
-        SET
-          enabled = $1,
-          updated_at = NOW()
-        WHERE id = $2
-        RETURNING *
-        `,
-        [enabled, req.params.id]
-      );
-
-      if (!result.rows.length) {
-        return sendError(
-          res,
-          404,
-          "Feature not found."
-        );
-      }
-
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "feature_status_changed",
-        targetType: "feature",
-        targetId: req.params.id,
-        details: { enabled }
-      });
-
-      return res.json({
-        ok: true,
-        feature: result.rows[0]
-      });
-    } catch (error) {
-      return sendError(
+    if (!result.rows.length) {
+      return jsonError(
         res,
-        500,
-        "Unable to update feature."
+        404,
+        'Feature not found.'
       );
     }
-  }
+
+    res.json({
+      ok: true,
+      feature: result.rows[0]
+    });
+  })
 );
 
 /* =========================================================
-   WALLET TRANSACTIONS
+   WALLET
 ========================================================= */
 
 app.get(
-  "/api/admin/wallet/transactions",
+  '/api/wallet',
   requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          wt.*,
-          u.full_name,
-          u.phone,
-          u.network_number
-        FROM wallet_transactions wt
-        LEFT JOIN users u ON u.id = wt.user_id
-        ORDER BY wt.created_at DESC
-        LIMIT 200
-        `
-      );
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM wallets
+      WHERE user_id = $1
+      LIMIT 1
+      `,
+      [req.auth.sub]
+    );
 
+    if (!result.rows.length) {
       return res.json({
         ok: true,
-        transactions: result.rows
+        wallet: null
       });
-    } catch (error) {
-      console.error("Wallet transactions:", error);
-
-      return sendError(
-        res,
-        500,
-        "Unable to load wallet transactions."
-      );
     }
-  }
+
+    res.json({
+      ok: true,
+      wallet: result.rows[0]
+    });
+  })
+);
+
+/* =========================================================
+   ADMIN - WALLET TRANSACTIONS
+========================================================= */
+
+app.get(
+  '/api/admin/wallet/transactions',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM wallet_transactions
+      ORDER BY created_at DESC
+      LIMIT 500
+      `
+    );
+
+    res.json({
+      ok: true,
+      transactions: result.rows
+    });
+  })
 );
 
 /* =========================================================
@@ -1599,223 +1440,364 @@ app.get(
 ========================================================= */
 
 app.get(
-  "/api/admin/rates",
+  '/api/config/rates',
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM call_rates
+      ORDER BY country_code ASC
+      `
+    );
+
+    res.json({
+      ok: true,
+      rates: result.rows
+    });
+  })
+);
+
+app.get(
+  '/api/admin/rates',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT *
-        FROM call_rates
-        ORDER BY country_name ASC
-        `
-      );
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM call_rates
+      ORDER BY country_code ASC
+      `
+    );
 
-      return res.json({
-        ok: true,
-        rates: result.rows
-      });
-    } catch (error) {
-      return sendError(
-        res,
-        500,
-        "Unable to load call rates."
-      );
-    }
-  }
+    res.json({
+      ok: true,
+      rates: result.rows
+    });
+  })
 );
 
 app.patch(
-  "/api/admin/rates/:id",
+  '/api/admin/rates/:id',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const {
-        provider_cost,
-        customer_rate,
-        pulse_seconds
-      } = req.body;
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const {
+      provider_cost,
+      customer_rate,
+      pulse_seconds
+    } = req.body || {};
 
-      const result = await pool.query(
-        `
-        UPDATE call_rates
-        SET
-          provider_cost = COALESCE($1, provider_cost),
-          customer_rate = COALESCE($2, customer_rate),
-          pulse_seconds = COALESCE($3, pulse_seconds),
-          updated_at = NOW()
-        WHERE id = $4
-        RETURNING *
-        `,
-        [
-          provider_cost ?? null,
-          customer_rate ?? null,
-          pulse_seconds ?? null,
-          req.params.id
-        ]
-      );
+    const result = await pool.query(
+      `
+      UPDATE call_rates
+      SET
+        provider_cost = COALESCE($1, provider_cost),
+        customer_rate = COALESCE($2, customer_rate),
+        pulse_seconds = COALESCE($3, pulse_seconds),
+        updated_at = NOW()
+      WHERE id = $4
+      RETURNING *
+      `,
+      [
+        provider_cost ?? null,
+        customer_rate ?? null,
+        pulse_seconds ?? null,
+        req.params.id
+      ]
+    );
 
-      if (!result.rows.length) {
-        return sendError(
-          res,
-          404,
-          "Call rate not found."
-        );
-      }
-
-      await writeAudit({
-        adminId: req.auth.id,
-        action: "call_rate_updated",
-        targetType: "call_rate",
-        targetId: req.params.id,
-        details: req.body
-      });
-
-      return res.json({
-        ok: true,
-        rate: result.rows[0]
-      });
-    } catch (error) {
-      console.error("Rate update:", error);
-
-      return sendError(
+    if (!result.rows.length) {
+      return jsonError(
         res,
-        500,
-        "Unable to update call rate."
+        404,
+        'Rate not found.'
       );
     }
-  }
+
+    res.json({
+      ok: true,
+      rate: result.rows[0]
+    });
+  })
 );
 
 /* =========================================================
    AUDIT LOG
 ========================================================= */
 
+async function writeAuditLog({
+  adminId = null,
+  action,
+  entityType = null,
+  entityId = null,
+  details = {}
+}) {
+  if (!pool || !dbReady) return;
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO audit_logs
+        (
+          admin_id,
+          action,
+          entity_type,
+          entity_id,
+          details,
+          created_at
+        )
+      VALUES
+        ($1, $2, $3, $4, $5, NOW())
+      `,
+      [
+        adminId,
+        action,
+        entityType,
+        entityId,
+        JSON.stringify(details)
+      ]
+    );
+  } catch (error) {
+    console.error(
+      '[AUDIT LOG ERROR]',
+      error.message
+    );
+  }
+}
+
 app.get(
-  "/api/admin/audit-logs",
+  '/api/admin/audit-logs',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT
-          al.*,
-          ma.username AS admin_username
-        FROM audit_logs al
-        LEFT JOIN master_admins ma
-          ON ma.id = al.admin_id
-        ORDER BY al.created_at DESC
-        LIMIT 300
-        `
-      );
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM audit_logs
+      ORDER BY created_at DESC
+      LIMIT 500
+      `
+    );
 
-      return res.json({
-        ok: true,
-        logs: result.rows
-      });
-    } catch (error) {
-      return sendError(
-        res,
-        500,
-        "Unable to load audit logs."
-      );
-    }
-  }
+    res.json({
+      ok: true,
+      logs: result.rows
+    });
+  })
 );
 
 /* =========================================================
-   SAFE PLACEHOLDER ENDPOINTS
-   No fake data is returned.
+   DASHBOARD SUMMARY
 ========================================================= */
 
 app.get(
-  "/api/admin/gateways",
+  '/api/admin/dashboard/summary',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(`
+      SELECT
+        (SELECT COUNT(*) FROM users) AS total_users,
+        (SELECT COUNT(*) FROM users WHERE status = 'active') AS active_users,
+        (SELECT COUNT(*) FROM kyc_records WHERE status = 'pending') AS pending_kyc,
+        (SELECT COUNT(*) FROM kyc_records WHERE status = 'manual_review') AS manual_review_kyc,
+        (SELECT COALESCE(SUM(balance), 0) FROM wallets) AS total_wallet_balance
+    `);
+
+    res.json({
       ok: true,
-      gateways: []
+      summary: result.rows[0],
+      system: {
+        database: dbReady ? 'connected' : 'disconnected',
+        backend: 'online'
+      }
     });
-  }
+  })
 );
 
-app.get(
-  "/api/admin/live-calls",
-  requireAuth,
-  requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
-      ok: true,
-      calls: []
-    });
-  }
-);
+/* =========================================================
+   CALLING
+========================================================= */
 
 app.get(
-  "/api/admin/sms",
+  '/api/admin/calls/live',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    /*
+     * Real provider integration will populate live call data.
+     * Never invent active calls.
+     */
+    res.json({
       ok: true,
-      provider: null,
+      calls: [],
+      provider: 'not_configured'
+    });
+  })
+);
+
+/* =========================================================
+   SMS
+========================================================= */
+
+app.get(
+  '/api/admin/sms/summary',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
+      ok: true,
+      provider: 'not_configured',
       todayCount: 0,
-      todayCost: 0,
-      messages: []
+      todayCost: 0
     });
-  }
+  })
 );
 
+/* =========================================================
+   SUPPORT
+========================================================= */
+
 app.get(
-  "/api/admin/support",
+  '/api/admin/support',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
       ok: true,
       tickets: []
     });
-  }
+  })
 );
 
+/* =========================================================
+   PAYMENT GATEWAYS
+========================================================= */
+
 app.get(
-  "/api/admin/subadmins",
+  '/api/admin/payment-gateways',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
+      ok: true,
+      gateways: [],
+      message: 'Payment provider is not configured yet.'
+    });
+  })
+);
+
+/* =========================================================
+   SUB ADMINS
+========================================================= */
+
+app.get(
+  '/api/admin/sub-admins',
+  requireAuth,
+  requireMasterAdmin,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
       ok: true,
       subAdmins: []
     });
-  }
+  })
 );
 
+/* =========================================================
+   API / APPS
+========================================================= */
+
 app.get(
-  "/api/admin/apps",
+  '/api/admin/apps',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
       ok: true,
       apps: []
     });
-  }
+  })
 );
 
+/* =========================================================
+   ANALYTICS
+========================================================= */
+
 app.get(
-  "/api/admin/analytics",
+  '/api/admin/analytics',
   requireAuth,
   requireMasterAdmin,
-  async (req, res) => {
-    return res.json({
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    res.json({
       ok: true,
-      data: []
+      analytics: {
+        users: [],
+        calls: [],
+        revenue: [],
+        sms: []
+      }
     });
-  }
+  })
+);
+
+/* =========================================================
+   2FA
+========================================================= */
+
+app.post(
+  '/api/admin/2fa/enable',
+  requireAuth,
+  requireMasterAdmin,
+  asyncHandler(async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error: '2FA provider is not configured yet.',
+      code: 'TWO_FACTOR_PROVIDER_NOT_CONFIGURED'
+    });
+  })
+);
+
+/* =========================================================
+   FORGOT / RESET PASSWORD
+========================================================= */
+
+app.post(
+  '/api/admin/forgot-password',
+  authLimiter,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error: 'Password reset email provider is not configured yet.',
+      code: 'EMAIL_PROVIDER_NOT_CONFIGURED'
+    });
+  })
+);
+
+app.post(
+  '/api/admin/reset-password',
+  authLimiter,
+  requireDatabase,
+  asyncHandler(async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error: 'Password reset provider is not configured yet.',
+      code: 'PASSWORD_RESET_NOT_CONFIGURED'
+    });
+  })
 );
 
 /* =========================================================
@@ -1823,10 +1805,10 @@ app.get(
 ========================================================= */
 
 app.use((req, res) => {
-  return res.status(404).json({
+  res.status(404).json({
     ok: false,
-    error: "API route not found.",
-    path: req.path,
+    error: 'API route not found.',
+    path: req.originalUrl,
     requestId: req.requestId
   });
 });
@@ -1835,61 +1817,127 @@ app.use((req, res) => {
    ERROR HANDLER
 ========================================================= */
 
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
+app.use((error, req, res, next) => {
+  console.error(
+    `[ERROR ${req.requestId}]`,
+    error
+  );
 
-  if (err.message === "CORS origin not allowed") {
-    return sendError(res, 403, "CORS origin not allowed.");
+  if (res.headersSent) {
+    return next(error);
   }
 
-  return sendError(
-    res,
-    500,
-    "Internal server error."
-  );
+  if (error.message === 'CORS origin not allowed') {
+    return res.status(403).json({
+      ok: false,
+      error: 'CORS origin not allowed.',
+      requestId: req.requestId
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    error: IS_PRODUCTION
+      ? 'Internal server error.'
+      : error.message,
+    requestId: req.requestId
+  });
 });
 
 /* =========================================================
    START SERVER
 ========================================================= */
 
-async function startServer() {
-  try {
-    await pool.query("SELECT 1");
+/*
+ * IMPORTANT:
+ * The HTTP server starts FIRST.
+ * Database connection happens in the background.
+ *
+ * This prevents Render from waiting for PostgreSQL
+ * before detecting the service port.
+ */
 
-    console.log("Database connection successful.");
-
-    app.listen(PORT, () => {
-      console.log(
-        `Talkify Global Network backend running on port ${PORT}`
-      );
-
-      console.log(`Environment: ${NODE_ENV}`);
-    });
-  } catch (error) {
-    console.error(
-      "Database connection failed:",
-      error.message
+const server = app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    console.log(
+      `Talkify Global Network Backend listening on port ${PORT}`
     );
 
-    process.exit(1);
+    console.log(
+      `Environment: ${NODE_ENV}`
+    );
+
+    console.log(
+      `Database configured: ${DATABASE_URL ? 'YES' : 'NO'}`
+    );
+
+    startDatabaseMonitor();
   }
+);
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+========================================================= */
+
+async function shutdown(signal) {
+  console.log(`${signal} received. Shutting down...`);
+
+  server.close(async () => {
+    try {
+      if (pool) {
+        await pool.end();
+      }
+
+      console.log('Shutdown complete.');
+
+      process.exit(0);
+    } catch (error) {
+      console.error(
+        'Shutdown database error:',
+        error.message
+      );
+
+      process.exit(1);
+    }
+  });
+
+  setTimeout(() => {
+    process.exit(1);
+  }, 10000).unref();
 }
 
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM received. Closing database...");
+process.on(
+  'SIGTERM',
+  () => shutdown('SIGTERM')
+);
 
-  await pool.end();
+process.on(
+  'SIGINT',
+  () => shutdown('SIGINT')
+);
 
-  process.exit(0);
-});
+/* =========================================================
+   UNHANDLED ERRORS
+========================================================= */
 
-process.on("SIGINT", async () => {
-  console.log("SIGINT received. Closing database...");
+process.on(
+  'unhandledRejection',
+  (error) => {
+    console.error(
+      '[UNHANDLED REJECTION]',
+      error
+    );
+  }
+);
 
-  await pool.end();
-
-  process.exit(0);
-});
-
-startServer();
+process.on(
+  'uncaughtException',
+  (error) => {
+    console.error(
+      '[UNCAUGHT EXCEPTION]',
+      error
+    );
+  }
+);
