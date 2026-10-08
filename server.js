@@ -1,71 +1,102 @@
 const express = require("express");
-const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
-const jwt = require("jsonwebtoken");
-const cookieParser = require("cookie-parser");
-const rateLimit = require("express-rate-limit");
+const cors = require("cors");
 const helmet = require("helmet");
+const cookieParser = require("cookie-parser");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+const { Pool } = require("pg");
 
 const app = express();
 
 const PORT = process.env.PORT || 10000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  "CHANGE_THIS_SECRET_BEFORE_PRODUCTION_2026_TALKIFY";
+const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_IN_PRODUCTION";
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "";
 
-const FRONTEND_ORIGIN =
-  process.env.FRONTEND_ORIGIN || "";
+if (!DATABASE_URL) {
+  console.error("ERROR: DATABASE_URL is not configured.");
+  process.exit(1);
+}
 
-const configuredOrigins = FRONTEND_ORIGIN
-  .split(",")
-  .map(v => v.trim())
-  .filter(Boolean);
-
-const isProduction = NODE_ENV === "production";
+if (
+  NODE_ENV === "production" &&
+  (!process.env.JWT_SECRET ||
+    process.env.JWT_SECRET === "CHANGE_THIS_IN_PRODUCTION")
+) {
+  console.error("ERROR: A strong JWT_SECRET is required in production.");
+  process.exit(1);
+}
 
 /* =========================================================
-   BASIC APP CONFIG
+   DATABASE
+========================================================= */
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
+
+/* =========================================================
+   SECURITY / CORS
 ========================================================= */
 
 app.disable("x-powered-by");
 
-if (isProduction) {
-  app.set("trust proxy", 1);
-}
-
-/* =========================================================
-   SECURITY HEADERS
-========================================================= */
-
 app.use(
   helmet({
-    crossOriginResourcePolicy: {
-      policy: "cross-origin"
-    },
-    contentSecurityPolicy: false
+    crossOriginResourcePolicy: false
   })
 );
 
-/* =========================================================
-   BODY PARSER
-========================================================= */
-
-app.use(
-  express.json({
-    limit: "2mb"
-  })
-);
-
-app.use(
-  express.urlencoded({
-    extended: true,
-    limit: "2mb"
-  })
-);
-
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
+
+const allowedOrigins = FRONTEND_ORIGIN
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  credentials: true,
+  origin: function (origin, callback) {
+    // Development: allow SPCK preview and local testing.
+    if (NODE_ENV !== "production") {
+      if (
+        !origin ||
+        origin === "null" ||
+        origin.startsWith("http://localhost") ||
+        origin.startsWith("http://127.0.0.1") ||
+        origin.startsWith("https://localhost") ||
+        origin.startsWith("https://127.0.0.1")
+      ) {
+        return callback(null, true);
+      }
+
+      return callback(null, true);
+    }
+
+    // Production: only explicitly configured origins.
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("CORS origin not allowed"));
+  }
+};
+
+app.use(cors(corsOptions));
 
 /* =========================================================
    REQUEST ID
@@ -75,87 +106,7 @@ app.use((req, res, next) => {
   const requestId = crypto.randomUUID();
 
   req.requestId = requestId;
-  res.setHeader("X-Request-Id", requestId);
-
-  next();
-});
-
-/* =========================================================
-   CORS
-========================================================= */
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  /*
-    DEVELOPMENT:
-    SPCK Preview may send:
-      - null
-      - localhost
-      - 127.0.0.1
-      - local/LAN origins
-
-    Therefore, during development we reflect the actual
-    origin instead of using "*" because credentials/cookies
-    cannot safely work with "*" + Access-Control-Allow-Credentials.
-  */
-
-  if (!isProduction) {
-    if (origin) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-    } else {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-    }
-
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With, Accept"
-    );
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    );
-    res.setHeader(
-      "Access-Control-Expose-Headers",
-      "Content-Length, X-Request-Id"
-    );
-
-    res.setHeader("Vary", "Origin");
-
-    if (req.method === "OPTIONS") {
-      return res.status(204).end();
-    }
-
-    return next();
-  }
-
-  /*
-    PRODUCTION:
-    Only explicitly configured frontend origins are allowed.
-  */
-
-  if (origin && configuredOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With, Accept"
-    );
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    );
-    res.setHeader(
-      "Access-Control-Expose-Headers",
-      "Content-Length, X-Request-Id"
-    );
-    res.setHeader("Vary", "Origin");
-  }
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
+  res.setHeader("X-Request-ID", requestId);
 
   next();
 });
@@ -166,168 +117,156 @@ app.use((req, res, next) => {
 
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 300,
+  limit: 300,
   standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    ok: false,
-    message: "Too many requests. Please try again later."
-  }
+  legacyHeaders: false
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 30,
+  limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
     ok: false,
-    message: "Too many authentication attempts. Please try again later."
+    error: "Too many authentication attempts. Please try again later."
   }
 });
 
 app.use(generalLimiter);
 
 /* =========================================================
-   DEVELOPMENT DATABASE
-   NOTE:
-   This is temporary.
-   Production will use PostgreSQL/Supabase.
-========================================================= */
-
-const db = {
-  masterAdmin: null,
-
-  resetTokens: new Map(),
-
-  sessions: new Map(),
-
-  auditLogs: [],
-
-  twoFA: {
-    enabled: false
-  }
-};
-
-/* =========================================================
    HELPERS
 ========================================================= */
 
-function nowISO() {
-  return new Date().toISOString();
+function sendError(res, status, message, extra = {}) {
+  return res.status(status).json({
+    ok: false,
+    error: message,
+    requestId: res.getHeader("X-Request-ID"),
+    ...extra
+  });
 }
 
-function normalizeEmail(email) {
-  return String(email || "")
-    .trim()
-    .toLowerCase();
-}
-
-function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function isStrongPassword(password) {
-  return (
-    typeof password === "string" &&
-    password.length >= 12
-  );
-}
-
-function createToken(payload, expiresIn = "8h") {
+function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, {
-    expiresIn,
-    issuer: "talkify-global-network",
-    audience: "talkify-admin"
+    expiresIn: "7d"
   });
 }
 
 function verifyToken(token) {
-  return jwt.verify(token, JWT_SECRET, {
-    issuer: "talkify-global-network",
-    audience: "talkify-admin"
-  });
+  return jwt.verify(token, JWT_SECRET);
 }
 
 function setAuthCookie(res, token) {
-  res.cookie("talkify_admin_session", token, {
+  res.cookie("talkify_session", token, {
     httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
-    maxAge: 8 * 60 * 60 * 1000,
+    secure: NODE_ENV === "production",
+    sameSite: NODE_ENV === "production" ? "none" : "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/"
   });
 }
 
 function clearAuthCookie(res) {
-  res.clearCookie("talkify_admin_session", {
+  res.clearCookie("talkify_session", {
     httpOnly: true,
-    secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
+    secure: NODE_ENV === "production",
+    sameSite: NODE_ENV === "production" ? "none" : "lax",
     path: "/"
   });
 }
 
-function getAuthToken(req) {
-  if (req.cookies && req.cookies.talkify_admin_session) {
-    return req.cookies.talkify_admin_session;
+function getTokenFromRequest(req) {
+  if (req.cookies && req.cookies.talkify_session) {
+    return req.cookies.talkify_session;
   }
 
-  const header = req.headers.authorization || "";
+  const auth = req.headers.authorization || "";
 
-  if (header.startsWith("Bearer ")) {
-    return header.substring(7);
+  if (auth.startsWith("Bearer ")) {
+    return auth.substring(7);
   }
 
   return null;
 }
 
-function requireMasterAdmin(req, res, next) {
-  const token = getAuthToken(req);
-
-  if (!token) {
-    return res.status(401).json({
-      authenticated: false,
-      message: "Authentication required.",
-      requestId: req.requestId
-    });
-  }
-
+function requireAuth(req, res, next) {
   try {
-    const decoded = verifyToken(token);
+    const token = getTokenFromRequest(req);
 
-    if (decoded.role !== "master_admin") {
-      return res.status(403).json({
-        authenticated: false,
-        message: "Master Admin access required.",
-        requestId: req.requestId
-      });
+    if (!token) {
+      return sendError(res, 401, "Authentication required.");
     }
 
-    req.admin = decoded;
+    const payload = verifyToken(token);
+
+    req.auth = payload;
 
     next();
   } catch (error) {
-    clearAuthCookie(res);
-
-    return res.status(401).json({
-      authenticated: false,
-      message: "Session expired or invalid.",
-      requestId: req.requestId
-    });
+    return sendError(res, 401, "Invalid or expired session.");
   }
 }
 
-function addAudit(action, details = {}) {
-  db.auditLogs.unshift({
-    id: crypto.randomUUID(),
-    action,
-    details,
-    createdAt: nowISO()
-  });
+function requireMasterAdmin(req, res, next) {
+  if (!req.auth || req.auth.type !== "master_admin") {
+    return sendError(res, 403, "Master Admin access required.");
+  }
 
-  if (db.auditLogs.length > 500) {
-    db.auditLogs.length = 500;
+  next();
+}
+
+function normalizePhone(phone) {
+  return String(phone || "")
+    .trim()
+    .replace(/[^\d+]/g, "");
+}
+
+function generateRegistrationId() {
+  return (
+    "REG-" +
+    Date.now().toString(36).toUpperCase() +
+    "-" +
+    crypto.randomBytes(3).toString("hex").toUpperCase()
+  );
+}
+
+/* =========================================================
+   AUDIT LOG
+========================================================= */
+
+async function writeAudit({
+  adminId = null,
+  action,
+  targetType = null,
+  targetId = null,
+  details = {}
+}) {
+  try {
+    await pool.query(
+      `
+      INSERT INTO audit_logs
+      (
+        admin_id,
+        action,
+        target_type,
+        target_id,
+        details,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, NOW())
+      `,
+      [
+        adminId,
+        action,
+        targetType,
+        targetId,
+        JSON.stringify(details)
+      ]
+    );
+  } catch (error) {
+    console.error("Audit log error:", error.message);
   }
 }
 
@@ -335,14 +274,126 @@ function addAudit(action, details = {}) {
    HEALTH
 ========================================================= */
 
-app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    service: "Talkify Global Network Backend",
-    time: nowISO(),
-    environment: NODE_ENV,
-    requestId: req.requestId
-  });
+app.get("/api/health", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT NOW() AS db_time");
+
+    return res.json({
+      ok: true,
+      service: "Talkify Global Network Backend",
+      time: new Date().toISOString(),
+      environment: NODE_ENV,
+      database: "connected",
+      dbTime: result.rows[0].db_time,
+      requestId: req.requestId
+    });
+  } catch (error) {
+    return res.status(503).json({
+      ok: false,
+      service: "Talkify Global Network Backend",
+      time: new Date().toISOString(),
+      environment: NODE_ENV,
+      database: "error",
+      error: "Database connection failed.",
+      requestId: req.requestId
+    });
+  }
+});
+
+/* =========================================================
+   AUTH SESSION
+========================================================= */
+
+app.get("/api/auth/session", async (req, res) => {
+  try {
+    const token = getTokenFromRequest(req);
+
+    if (!token) {
+      return res.json({
+        ok: true,
+        authenticated: false
+      });
+    }
+
+    const payload = verifyToken(token);
+
+    if (payload.type === "master_admin") {
+      const result = await pool.query(
+        `
+        SELECT id, username, display_name, is_active
+        FROM master_admins
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [payload.id]
+      );
+
+      if (!result.rows.length || !result.rows[0].is_active) {
+        clearAuthCookie(res);
+
+        return res.json({
+          ok: true,
+          authenticated: false
+        });
+      }
+
+      return res.json({
+        ok: true,
+        authenticated: true,
+        type: "master_admin",
+        user: result.rows[0]
+      });
+    }
+
+    if (payload.type === "user") {
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          phone,
+          network_number,
+          full_name,
+          kyc_status,
+          is_active,
+          created_at
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [payload.id]
+      );
+
+      if (!result.rows.length || !result.rows[0].is_active) {
+        clearAuthCookie();
+
+        return res.json({
+          ok: true,
+          authenticated: false
+        });
+      }
+
+      return res.json({
+        ok: true,
+        authenticated: true,
+        type: "user",
+        user: result.rows[0]
+      });
+    }
+
+    clearAuthCookie();
+
+    return res.json({
+      ok: true,
+      authenticated: false
+    });
+  } catch (error) {
+    clearAuthCookie();
+
+    return res.json({
+      ok: true,
+      authenticated: false
+    });
+  }
 });
 
 /* =========================================================
@@ -350,68 +401,90 @@ app.get("/api/health", (req, res) => {
 ========================================================= */
 
 app.post(
-  "/api/admin/auth/setup",
+  "/api/admin/setup",
   authLimiter,
   async (req, res) => {
     try {
-      if (db.masterAdmin) {
-        return res.status(409).json({
-          ok: false,
-          message: "Master Admin account already exists.",
-          requestId: req.requestId
-        });
+      const { username, password, displayName } = req.body;
+
+      if (!username || !password) {
+        return sendError(
+          res,
+          400,
+          "Username and password are required."
+        );
       }
 
-      const email = normalizeEmail(req.body.email);
-      const password = req.body.password;
-
-      if (!isValidEmail(email)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Please provide a valid Admin email.",
-          requestId: req.requestId
-        });
+      if (String(password).length < 8) {
+        return sendError(
+          res,
+          400,
+          "Password must contain at least 8 characters."
+        );
       }
 
-      if (!isStrongPassword(password)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Password must contain at least 12 characters.",
-          requestId: req.requestId
-        });
+      const countResult = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM master_admins`
+      );
+
+      if (countResult.rows[0].count > 0) {
+        return sendError(
+          res,
+          409,
+          "Master Admin setup has already been completed."
+        );
       }
 
       const passwordHash = await bcrypt.hash(password, 12);
 
-      db.masterAdmin = {
-        id: crypto.randomUUID(),
-        email,
-        passwordHash,
-        role: "master_admin",
-        createdAt: nowISO(),
-        updatedAt: nowISO(),
-        lastLoginAt: null
-      };
+      const result = await pool.query(
+        `
+        INSERT INTO master_admins
+        (
+          username,
+          password_hash,
+          display_name,
+          is_active,
+          created_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3, true, NOW(), NOW())
+        RETURNING id, username, display_name, is_active, created_at
+        `,
+        [
+          String(username).trim(),
+          passwordHash,
+          displayName || "Master Admin"
+        ]
+      );
 
-      addAudit("master_admin_created", {
-        email
+      await writeAudit({
+        adminId: result.rows[0].id,
+        action: "master_admin_setup",
+        targetType: "master_admin",
+        targetId: result.rows[0].id,
+        details: {
+          username: result.rows[0].username
+        }
       });
 
       return res.status(201).json({
         ok: true,
-        authenticated: false,
-        role: "master_admin",
-        message: "Master Admin account created successfully.",
-        requestId: req.requestId
+        message: "Master Admin setup completed.",
+        admin: result.rows[0]
       });
     } catch (error) {
-      console.error("SETUP ERROR:", error);
+      console.error("Admin setup:", error);
 
-      return res.status(500).json({
-        ok: false,
-        message: "Master Admin setup failed.",
-        requestId: req.requestId
-      });
+      if (error.code === "23505") {
+        return sendError(res, 409, "Username already exists.");
+      }
+
+      return sendError(
+        res,
+        500,
+        "Master Admin setup failed."
+      );
     }
   }
 );
@@ -421,155 +494,92 @@ app.post(
 ========================================================= */
 
 app.post(
-  "/api/admin/auth/login",
+  "/api/admin/login",
   authLimiter,
   async (req, res) => {
     try {
-      const email = normalizeEmail(req.body.email);
-      const password = req.body.password;
+      const { username, password } = req.body;
 
-      if (!db.masterAdmin) {
-        return res.status(404).json({
-          ok: false,
-          message: "Master Admin account has not been created yet.",
-          requestId: req.requestId
-        });
-      }
-
-      if (!email || !password) {
-        return res.status(400).json({
-          ok: false,
-          message: "Email and password are required.",
-          requestId: req.requestId
-        });
-      }
-
-      const emailMatches =
-        email === db.masterAdmin.email;
-
-      const passwordMatches =
-        await bcrypt.compare(
-          password,
-          db.masterAdmin.passwordHash
+      if (!username || !password) {
+        return sendError(
+          res,
+          400,
+          "Username and password are required."
         );
-
-      if (!emailMatches || !passwordMatches) {
-        addAudit("master_admin_login_failed", {
-          email
-        });
-
-        return res.status(401).json({
-          ok: false,
-          authenticated: false,
-          message: "Invalid email or password.",
-          requestId: req.requestId
-        });
       }
 
-      /*
-        2FA is intentionally not faked.
-        If later enabled through a real provider,
-        this branch can return a real challenge.
-      */
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM master_admins
+        WHERE username = $1
+        LIMIT 1
+        `,
+        [String(username).trim()]
+      );
 
-      if (db.twoFA.enabled) {
-        const challengeId = crypto.randomUUID();
-
-        db.sessions.set(challengeId, {
-          type: "2fa_challenge",
-          email,
-          createdAt: nowISO(),
-          expiresAt: Date.now() + 5 * 60 * 1000
-        });
-
-        return res.json({
-          ok: true,
-          authenticated: false,
-          requires2FA: true,
-          challengeId,
-          message: "2FA verification required.",
-          requestId: req.requestId
-        });
+      if (!result.rows.length) {
+        return sendError(res, 401, "Invalid username or password.");
       }
 
-      const token = createToken({
-        sub: db.masterAdmin.id,
-        email: db.masterAdmin.email,
-        role: "master_admin"
+      const admin = result.rows[0];
+
+      if (!admin.is_active) {
+        return sendError(res, 403, "This admin account is disabled.");
+      }
+
+      const valid = await bcrypt.compare(
+        String(password),
+        admin.password_hash
+      );
+
+      if (!valid) {
+        return sendError(res, 401, "Invalid username or password.");
+      }
+
+      const token = signToken({
+        id: admin.id,
+        type: "master_admin",
+        username: admin.username
       });
-
-      db.masterAdmin.lastLoginAt = nowISO();
 
       setAuthCookie(res, token);
 
-      addAudit("master_admin_login_success", {
-        email
+      await pool.query(
+        `
+        UPDATE master_admins
+        SET last_login_at = NOW(), updated_at = NOW()
+        WHERE id = $1
+        `,
+        [admin.id]
+      );
+
+      await writeAudit({
+        adminId: admin.id,
+        action: "master_admin_login",
+        targetType: "master_admin",
+        targetId: admin.id,
+        details: {}
       });
 
       return res.json({
         ok: true,
         authenticated: true,
-        role: "master_admin",
-        email: db.masterAdmin.email,
-        message: "Login successful.",
-        requestId: req.requestId
+        type: "master_admin",
+        admin: {
+          id: admin.id,
+          username: admin.username,
+          display_name: admin.display_name
+        }
       });
     } catch (error) {
-      console.error("LOGIN ERROR:", error);
+      console.error("Admin login:", error);
 
-      return res.status(500).json({
-        ok: false,
-        authenticated: false,
-        message: "Authentication failed.",
-        requestId: req.requestId
-      });
-    }
-  }
-);
-
-/* =========================================================
-   SESSION
-========================================================= */
-
-app.get(
-  "/api/admin/auth/session",
-  async (req, res) => {
-    const token = getAuthToken(req);
-
-    if (!token) {
-      return res.status(401).json({
-        authenticated: false,
-        message: "Authentication required.",
-        requestId: req.requestId
-      });
-    }
-
-    try {
-      const decoded = verifyToken(token);
-
-      if (decoded.role !== "master_admin") {
-        return res.status(403).json({
-          authenticated: false,
-          message: "Master Admin access required.",
-          requestId: req.requestId
-        });
-      }
-
-      return res.json({
-        ok: true,
-        authenticated: true,
-        role: "master_admin",
-        email: decoded.email,
-        requestId: req.requestId
-      });
-    } catch (error) {
-      clearAuthCookie(res);
-
-      return res.status(401).json({
-        authenticated: false,
-        message: "Session expired or invalid.",
-        requestId: req.requestId
-      });
+      return sendError(
+        res,
+        500,
+        "Login failed."
+      );
     }
   }
 );
@@ -578,324 +588,512 @@ app.get(
    LOGOUT
 ========================================================= */
 
-app.post(
-  "/api/admin/auth/logout",
-  requireMasterAdmin,
-  (req, res) => {
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  try {
+    if (req.auth && req.auth.type === "master_admin") {
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "logout",
+        targetType: "master_admin",
+        targetId: req.auth.id
+      });
+    }
+
     clearAuthCookie(res);
 
-    addAudit("master_admin_logout", {
-      email: req.admin.email
+    return res.json({
+      ok: true,
+      message: "Logged out successfully."
     });
+  } catch (error) {
+    clearAuthCookie(res);
 
     return res.json({
       ok: true,
-      authenticated: false,
-      message: "Logged out successfully.",
-      requestId: req.requestId
+      message: "Logged out successfully."
     });
   }
-);
+});
 
 /* =========================================================
-   CHANGE PASSWORD
+   CHANGE MASTER ADMIN PASSWORD
 ========================================================= */
 
 app.post(
-  "/api/admin/auth/change-password",
+  "/api/admin/change-password",
+  requireAuth,
   requireMasterAdmin,
   authLimiter,
   async (req, res) => {
     try {
-      const currentPassword = req.body.currentPassword;
-      const newPassword = req.body.newPassword;
+      const { currentPassword, newPassword } = req.body;
 
-      if (!isStrongPassword(newPassword)) {
-        return res.status(400).json({
-          ok: false,
-          message: "New password must contain at least 12 characters.",
-          requestId: req.requestId
-        });
-      }
-
-      const currentMatches =
-        await bcrypt.compare(
-          currentPassword,
-          db.masterAdmin.passwordHash
+      if (!currentPassword || !newPassword) {
+        return sendError(
+          res,
+          400,
+          "Current password and new password are required."
         );
-
-      if (!currentMatches) {
-        return res.status(401).json({
-          ok: false,
-          message: "Current password is incorrect.",
-          requestId: req.requestId
-        });
       }
 
-      db.masterAdmin.passwordHash =
-        await bcrypt.hash(newPassword, 12);
+      if (String(newPassword).length < 8) {
+        return sendError(
+          res,
+          400,
+          "New password must contain at least 8 characters."
+        );
+      }
 
-      db.masterAdmin.updatedAt = nowISO();
+      const result = await pool.query(
+        `
+        SELECT id, password_hash
+        FROM master_admins
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [req.auth.id]
+      );
 
-      addAudit("master_admin_password_changed", {
-        email: req.admin.email
+      if (!result.rows.length) {
+        return sendError(res, 404, "Admin account not found.");
+      }
+
+      const valid = await bcrypt.compare(
+        currentPassword,
+        result.rows[0].password_hash
+      );
+
+      if (!valid) {
+        return sendError(
+          res,
+          401,
+          "Current password is incorrect."
+        );
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, 12);
+
+      await pool.query(
+        `
+        UPDATE master_admins
+        SET password_hash = $1, updated_at = NOW()
+        WHERE id = $2
+        `,
+        [passwordHash, req.auth.id]
+      );
+
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "master_admin_password_changed",
+        targetType: "master_admin",
+        targetId: req.auth.id
       });
 
       return res.json({
         ok: true,
-        message: "Password changed successfully.",
-        requestId: req.requestId
+        message: "Password changed successfully."
       });
     } catch (error) {
-      console.error("CHANGE PASSWORD ERROR:", error);
+      console.error("Password change:", error);
 
-      return res.status(500).json({
-        ok: false,
-        message: "Password change failed.",
-        requestId: req.requestId
-      });
-    }
-  }
-);
-
-/* =========================================================
-   FORGOT PASSWORD
-========================================================= */
-
-app.post(
-  "/api/admin/auth/forgot-password",
-  authLimiter,
-  (req, res) => {
-    const email = normalizeEmail(req.body.email);
-
-    /*
-      Always return a generic response so that the API does
-      not reveal whether an account exists.
-    */
-
-    if (
-      db.masterAdmin &&
-      email === db.masterAdmin.email
-    ) {
-      const token = crypto.randomBytes(32).toString("hex");
-
-      db.resetTokens.set(token, {
-        email,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 15 * 60 * 1000
-      });
-
-      /*
-        IMPORTANT:
-        No fake email is claimed here.
-        A real email provider must be connected later.
-      */
-
-      console.log(
-        "PASSWORD RESET TOKEN CREATED:",
-        token
+      return sendError(
+        res,
+        500,
+        "Password change failed."
       );
     }
+  }
+);
 
-    return res.json({
-      ok: true,
-      message:
-        "If this email belongs to an Admin account, secure recovery instructions have been initiated.",
-      requestId: req.requestId
+/* =========================================================
+   FORGOT PASSWORD / 2FA
+   Real provider required — no fake success.
+========================================================= */
+
+app.post(
+  "/api/admin/forgot-password",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "Password recovery is not enabled yet. A verified email/SMS provider must be connected first."
+    });
+  }
+);
+
+app.post(
+  "/api/admin/2fa/send",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "2FA delivery is not enabled yet. A real OTP provider must be connected first."
+    });
+  }
+);
+
+app.post(
+  "/api/admin/2fa/verify",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "2FA verification is not enabled yet. A real OTP provider must be connected first."
     });
   }
 );
 
 /* =========================================================
-   RESET PASSWORD
+   COUNTRIES
 ========================================================= */
 
-app.post(
-  "/api/admin/auth/reset-password",
-  authLimiter,
+app.get("/api/config/countries", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        country_code,
+        country_name,
+        dial_code,
+        primary_language,
+        enabled
+      FROM countries
+      WHERE enabled = true
+      ORDER BY country_name ASC
+      `
+    );
+
+    return res.json({
+      ok: true,
+      countries: result.rows
+    });
+  } catch (error) {
+    console.error("Countries:", error);
+
+    return sendError(
+      res,
+      500,
+      "Unable to load countries."
+    );
+  }
+});
+
+app.get(
+  "/api/admin/countries",
+  requireAuth,
+  requireMasterAdmin,
   async (req, res) => {
     try {
-      const token = String(req.body.token || "");
-      const password = req.body.password;
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM countries
+        ORDER BY country_name ASC
+        `
+      );
 
-      if (!token) {
-        return res.status(400).json({
-          ok: false,
-          message: "Reset token is required.",
-          requestId: req.requestId
-        });
+      return res.json({
+        ok: true,
+        countries: result.rows
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load countries."
+      );
+    }
+  }
+);
+
+app.patch(
+  "/api/admin/countries/:id",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const { enabled } = req.body;
+
+      if (typeof enabled !== "boolean") {
+        return sendError(
+          res,
+          400,
+          "enabled must be true or false."
+        );
       }
 
-      if (!isStrongPassword(password)) {
-        return res.status(400).json({
-          ok: false,
-          message: "Password must contain at least 12 characters.",
-          requestId: req.requestId
-        });
+      const result = await pool.query(
+        `
+        UPDATE countries
+        SET enabled = $1, updated_at = NOW()
+        WHERE id = $2
+        RETURNING *
+        `,
+        [enabled, req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return sendError(res, 404, "Country not found.");
       }
 
-      const record = db.resetTokens.get(token);
-
-      if (!record) {
-        return res.status(400).json({
-          ok: false,
-          message: "Invalid or expired reset token.",
-          requestId: req.requestId
-        });
-      }
-
-      if (Date.now() > record.expiresAt) {
-        db.resetTokens.delete(token);
-
-        return res.status(400).json({
-          ok: false,
-          message: "Reset token has expired.",
-          requestId: req.requestId
-        });
-      }
-
-      if (
-        !db.masterAdmin ||
-        db.masterAdmin.email !== record.email
-      ) {
-        return res.status(400).json({
-          ok: false,
-          message: "Invalid password reset request.",
-          requestId: req.requestId
-        });
-      }
-
-      db.masterAdmin.passwordHash =
-        await bcrypt.hash(password, 12);
-
-      db.masterAdmin.updatedAt = nowISO();
-
-      db.resetTokens.delete(token);
-
-      addAudit("master_admin_password_reset", {
-        email: record.email
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "country_status_changed",
+        targetType: "country",
+        targetId: req.params.id,
+        details: { enabled }
       });
 
       return res.json({
         ok: true,
-        message: "Password changed successfully.",
-        requestId: req.requestId
+        country: result.rows[0]
       });
     } catch (error) {
-      console.error("RESET PASSWORD ERROR:", error);
-
-      return res.status(500).json({
-        ok: false,
-        message: "Password reset failed.",
-        requestId: req.requestId
-      });
+      return sendError(
+        res,
+        500,
+        "Unable to update country."
+      );
     }
   }
 );
 
 /* =========================================================
-   2FA ENABLE
+   USER REGISTRATION OTP
+   Real SMS provider required.
 ========================================================= */
 
 app.post(
-  "/api/admin/auth/2fa/enable",
-  requireMasterAdmin,
-  (req, res) => {
-    /*
-      We do NOT pretend that 2FA is active without a real
-      provider/secret setup.
-    */
-
-    return res.status(501).json({
-      ok: false,
-      message:
-        "2FA provider is not connected yet. No fake 2FA has been enabled.",
-      requestId: req.requestId
-    });
-  }
-);
-
-/* =========================================================
-   2FA DISABLE
-========================================================= */
-
-app.post(
-  "/api/admin/auth/2fa/disable",
-  requireMasterAdmin,
-  (req, res) => {
-    db.twoFA.enabled = false;
-
-    addAudit("master_admin_2fa_disabled", {
-      email: req.admin.email
-    });
-
-    return res.json({
-      ok: true,
-      enabled: false,
-      message: "2FA disabled.",
-      requestId: req.requestId
-    });
-  }
-);
-
-/* =========================================================
-   2FA VERIFY
-========================================================= */
-
-app.post(
-  "/api/admin/auth/2fa/verify",
+  "/api/auth/register/send-otp",
   authLimiter,
-  (req, res) => {
-    /*
-      No fake OTP verification.
-      A real 2FA provider will be connected later.
-    */
-
+  async (req, res) => {
     return res.status(501).json({
       ok: false,
-      authenticated: false,
-      message:
-        "2FA provider is not connected yet.",
-      requestId: req.requestId
+      error:
+        "Registration OTP is not enabled yet. Connect a real SMS provider before sending OTPs."
+    });
+  }
+);
+
+app.post(
+  "/api/auth/register/verify-otp",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "Registration OTP verification is not enabled yet. Connect a real SMS provider first."
     });
   }
 );
 
 /* =========================================================
-   REVOKE SESSIONS
+   USER LOGIN OTP
 ========================================================= */
 
 app.post(
-  "/api/admin/auth/revoke-sessions",
-  requireMasterAdmin,
-  (req, res) => {
-    db.sessions.clear();
-
-    addAudit("master_admin_sessions_revoked", {
-      email: req.admin.email
+  "/api/auth/login/send-otp",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "Login OTP is not enabled yet. Connect a real SMS provider first."
     });
+  }
+);
 
-    return res.json({
-      ok: true,
-      message: "Pending authentication challenges revoked.",
-      requestId: req.requestId
+app.post(
+  "/api/auth/login/verify-otp",
+  authLimiter,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "Login OTP verification is not enabled yet. Connect a real SMS provider first."
     });
   }
 );
 
 /* =========================================================
-   AUDIT LOG
+   USER PROFILE
 ========================================================= */
 
 app.get(
-  "/api/admin/audit",
-  requireMasterAdmin,
-  (req, res) => {
-    return res.json({
-      ok: true,
-      logs: db.auditLogs,
-      requestId: req.requestId
+  "/api/profile",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (req.auth.type !== "user") {
+        return sendError(res, 403, "User access required.");
+      }
+
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          phone,
+          network_number,
+          full_name,
+          date_of_birth,
+          gender,
+          nid_number,
+          kyc_status,
+          created_at
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [req.auth.id]
+      );
+
+      if (!result.rows.length) {
+        return sendError(res, 404, "User not found.");
+      }
+
+      return res.json({
+        ok: true,
+        profile: result.rows[0]
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load profile."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   KYC FACE MATCH
+   Real provider required.
+========================================================= */
+
+app.post(
+  "/api/kyc/face-match",
+  requireAuth,
+  async (req, res) => {
+    return res.status(501).json({
+      ok: false,
+      error:
+        "Face matching is not enabled yet. A real KYC/face verification provider must be connected."
     });
+  }
+);
+
+/* =========================================================
+   KYC SUBMIT
+========================================================= */
+
+app.post(
+  "/api/kyc/submit",
+  requireAuth,
+  async (req, res) => {
+    try {
+      if (req.auth.type !== "user") {
+        return sendError(res, 403, "User access required.");
+      }
+
+      const {
+        fullName,
+        dateOfBirth,
+        gender,
+        nidNumber,
+        idFrontUrl,
+        idBackUrl,
+        selfieUrl
+      } = req.body;
+
+      if (
+        !fullName ||
+        !dateOfBirth ||
+        !gender ||
+        !nidNumber
+      ) {
+        return sendError(
+          res,
+          400,
+          "Required KYC information is missing."
+        );
+      }
+
+      const userResult = await pool.query(
+        `
+        SELECT id
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [req.auth.id]
+      );
+
+      if (!userResult.rows.length) {
+        return sendError(res, 404, "User not found.");
+      }
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          full_name = $1,
+          date_of_birth = $2,
+          gender = $3,
+          nid_number = $4,
+          kyc_status = 'Pending',
+          updated_at = NOW()
+        WHERE id = $5
+        `,
+        [
+          fullName,
+          dateOfBirth,
+          gender,
+          nidNumber,
+          req.auth.id
+        ]
+      );
+
+      const result = await pool.query(
+        `
+        INSERT INTO kyc_records
+        (
+          user_id,
+          id_front_url,
+          id_back_url,
+          selfie_url,
+          status,
+          created_at,
+          updated_at
+        )
+        VALUES ($1, $2, $3, $4, 'Pending', NOW(), NOW())
+        RETURNING *
+        `,
+        [
+          req.auth.id,
+          idFrontUrl || null,
+          idBackUrl || null,
+          selfieUrl || null
+        ]
+      );
+
+      return res.status(201).json({
+        ok: true,
+        message: "KYC submitted for review.",
+        kyc: result.rows[0]
+      });
+    } catch (error) {
+      console.error("KYC submit:", error);
+
+      return sendError(
+        res,
+        500,
+        "KYC submission failed."
+      );
+    }
   }
 );
 
@@ -905,68 +1103,364 @@ app.get(
 
 app.get(
   "/api/admin/dashboard/summary",
+  requireAuth,
   requireMasterAdmin,
-  (req, res) => {
-    return res.json({
-      ok: true,
+  async (req, res) => {
+    try {
+      const users = await pool.query(
+        `SELECT COUNT(*)::int AS count FROM users`
+      );
 
-      users: {
-        total: 0,
-        active: 0,
-        pendingKyc: 0
-      },
+      const pendingKyc = await pool.query(
+        `
+        SELECT COUNT(*)::int AS count
+        FROM kyc_records
+        WHERE status IN ('Pending', 'manual_review')
+        `
+      );
 
-      calls: {
-        today: 0,
-        minutesToday: 0
-      },
+      const walletBalance = await pool.query(
+        `
+        SELECT COALESCE(SUM(balance), 0) AS total
+        FROM wallets
+        `
+      );
 
-      messages: {
-        today: 0
-      },
+      const transactions = await pool.query(
+        `
+        SELECT
+          COUNT(*)::int AS count,
+          COALESCE(SUM(amount), 0) AS amount
+        FROM wallet_transactions
+        WHERE created_at >= CURRENT_DATE
+        `
+      );
 
-      financial: {
-        totalBalance: 0,
-        todayRevenue: 0
-      },
+      return res.json({
+        ok: true,
+        metrics: {
+          totalUsers: users.rows[0].count,
+          onlineUsers: 0,
+          todayRecharge: Number(transactions.rows[0].amount || 0),
+          todaysCalls: 0,
+          totalWalletBalance: Number(
+            walletBalance.rows[0].total || 0
+          ),
+          callProviderCost: 0,
+          revenue: 0,
+          estimatedMargin: 0,
+          pendingTasks: pendingKyc.rows[0].count
+        }
+      });
+    } catch (error) {
+      console.error("Dashboard summary:", error);
 
-      kyc: {
-        pending: 0,
-        approved: 0,
-        rejected: 0
-      },
-
-      services: {
-        backend: "online",
-        database: "not_connected",
-        sms: "not_connected",
-        voice: "not_connected",
-        payment: "not_connected"
-      },
-
-      message:
-        "Dashboard values will become live after the production database and service providers are connected.",
-
-      requestId: req.requestId
-    });
+      return sendError(
+        res,
+        500,
+        "Unable to load dashboard summary."
+      );
+    }
   }
 );
 
 /* =========================================================
-   COUNTRIES
+   USERS
 ========================================================= */
 
 app.get(
-  "/api/admin/countries",
+  "/api/admin/users",
+  requireAuth,
   requireMasterAdmin,
-  (req, res) => {
-    return res.json({
-      ok: true,
-      countries: [],
-      message:
-        "Country configuration will be loaded from the production database.",
-      requestId: req.requestId
-    });
+  async (req, res) => {
+    try {
+      const search = String(req.query.search || "").trim();
+      const status = String(req.query.status || "").trim();
+
+      const params = [];
+      const conditions = [];
+
+      if (search) {
+        params.push(`%${search}%`);
+
+        conditions.push(`
+          (
+            full_name ILIKE $${params.length}
+            OR phone ILIKE $${params.length}
+            OR network_number ILIKE $${params.length}
+            OR registration_id ILIKE $${params.length}
+          )
+        `);
+      }
+
+      if (status) {
+        params.push(status);
+
+        conditions.push(
+          `kyc_status = $${params.length}`
+        );
+      }
+
+      const where = conditions.length
+        ? `WHERE ${conditions.join(" AND ")}`
+        : "";
+
+      const result = await pool.query(
+        `
+        SELECT
+          id,
+          registration_id,
+          phone,
+          network_number,
+          full_name,
+          date_of_birth,
+          gender,
+          kyc_status,
+          is_active,
+          created_at
+        FROM users
+        ${where}
+        ORDER BY created_at DESC
+        LIMIT 200
+        `,
+        params
+      );
+
+      return res.json({
+        ok: true,
+        users: result.rows
+      });
+    } catch (error) {
+      console.error("Users:", error);
+
+      return sendError(
+        res,
+        500,
+        "Unable to load users."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   USER DETAIL
+========================================================= */
+
+app.get(
+  "/api/admin/users/:id",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT
+          u.*,
+          k.id AS kyc_record_id,
+          k.id_front_url,
+          k.id_back_url,
+          k.selfie_url,
+          k.face_match_status,
+          k.status AS kyc_record_status,
+          k.created_at AS kyc_created_at
+        FROM users u
+        LEFT JOIN LATERAL (
+          SELECT *
+          FROM kyc_records
+          WHERE user_id = u.id
+          ORDER BY created_at DESC
+          LIMIT 1
+        ) k ON true
+        WHERE u.id = $1
+        LIMIT 1
+        `,
+        [req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return sendError(res, 404, "User not found.");
+      }
+
+      return res.json({
+        ok: true,
+        user: result.rows[0]
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load user."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   KYC LIST
+========================================================= */
+
+app.get(
+  "/api/admin/kyc",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const status = String(req.query.status || "").trim();
+      const search = String(req.query.search || "").trim();
+
+      const params = [];
+      const conditions = [];
+
+      if (status) {
+        params.push(status);
+        conditions.push(`k.status = $${params.length}`);
+      }
+
+      if (search) {
+        params.push(`%${search}%`);
+
+        conditions.push(`
+          (
+            u.full_name ILIKE $${params.length}
+            OR u.phone ILIKE $${params.length}
+            OR u.network_number ILIKE $${params.length}
+            OR u.nid_number ILIKE $${params.length}
+          )
+        `);
+      }
+
+      const where = conditions.length
+        ? `WHERE ${conditions.join(" AND ")}`
+        : "";
+
+      const result = await pool.query(
+        `
+        SELECT
+          k.*,
+          u.full_name,
+          u.phone,
+          u.network_number,
+          u.date_of_birth,
+          u.gender,
+          u.nid_number,
+          u.registration_id
+        FROM kyc_records k
+        JOIN users u ON u.id = k.user_id
+        ${where}
+        ORDER BY k.created_at DESC
+        LIMIT 200
+        `,
+        params
+      );
+
+      return res.json({
+        ok: true,
+        records: result.rows
+      });
+    } catch (error) {
+      console.error("KYC:", error);
+
+      return sendError(
+        res,
+        500,
+        "Unable to load KYC records."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   KYC DECISION
+========================================================= */
+
+app.patch(
+  "/api/admin/kyc/:id/decision",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const { status, notes } = req.body;
+
+      const allowed = [
+        "Pending",
+        "Approved",
+        "Rejected",
+        "manual_review"
+      ];
+
+      if (!allowed.includes(status)) {
+        return sendError(
+          res,
+          400,
+          "Invalid KYC status."
+        );
+      }
+
+      const kycResult = await pool.query(
+        `
+        UPDATE kyc_records
+        SET
+          status = $1,
+          review_notes = $2,
+          reviewed_by = $3,
+          reviewed_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $4
+        RETURNING *
+        `,
+        [
+          status,
+          notes || null,
+          req.auth.id,
+          req.params.id
+        ]
+      );
+
+      if (!kycResult.rows.length) {
+        return sendError(
+          res,
+          404,
+          "KYC record not found."
+        );
+      }
+
+      const kyc = kycResult.rows[0];
+
+      await pool.query(
+        `
+        UPDATE users
+        SET
+          kyc_status = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+        [status, kyc.user_id]
+      );
+
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "kyc_decision",
+        targetType: "kyc",
+        targetId: req.params.id,
+        details: {
+          status,
+          notes: notes || null
+        }
+      });
+
+      return res.json({
+        ok: true,
+        kyc
+      });
+    } catch (error) {
+      console.error("KYC decision:", error);
+
+      return sendError(
+        res,
+        500,
+        "Unable to update KYC status."
+      );
+    }
   }
 );
 
@@ -976,37 +1470,350 @@ app.get(
 
 app.get(
   "/api/admin/features",
+  requireAuth,
   requireMasterAdmin,
-  (req, res) => {
-    return res.json({
-      ok: true,
-      features: [],
-      message:
-        "Feature configuration will be loaded from the production database.",
-      requestId: req.requestId
-    });
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM features
+        ORDER BY name ASC
+        `
+      );
+
+      return res.json({
+        ok: true,
+        features: result.rows
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load features."
+      );
+    }
+  }
+);
+
+app.patch(
+  "/api/admin/features/:id",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const { enabled } = req.body;
+
+      if (typeof enabled !== "boolean") {
+        return sendError(
+          res,
+          400,
+          "enabled must be true or false."
+        );
+      }
+
+      const result = await pool.query(
+        `
+        UPDATE features
+        SET
+          enabled = $1,
+          updated_at = NOW()
+        WHERE id = $2
+        RETURNING *
+        `,
+        [enabled, req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return sendError(
+          res,
+          404,
+          "Feature not found."
+        );
+      }
+
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "feature_status_changed",
+        targetType: "feature",
+        targetId: req.params.id,
+        details: { enabled }
+      });
+
+      return res.json({
+        ok: true,
+        feature: result.rows[0]
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to update feature."
+      );
+    }
   }
 );
 
 /* =========================================================
-   ADMIN PROFILE
+   WALLET TRANSACTIONS
 ========================================================= */
 
 app.get(
-  "/api/admin/profile",
+  "/api/admin/wallet/transactions",
+  requireAuth,
   requireMasterAdmin,
-  (req, res) => {
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT
+          wt.*,
+          u.full_name,
+          u.phone,
+          u.network_number
+        FROM wallet_transactions wt
+        LEFT JOIN users u ON u.id = wt.user_id
+        ORDER BY wt.created_at DESC
+        LIMIT 200
+        `
+      );
+
+      return res.json({
+        ok: true,
+        transactions: result.rows
+      });
+    } catch (error) {
+      console.error("Wallet transactions:", error);
+
+      return sendError(
+        res,
+        500,
+        "Unable to load wallet transactions."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   CALL RATES
+========================================================= */
+
+app.get(
+  "/api/admin/rates",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM call_rates
+        ORDER BY country_name ASC
+        `
+      );
+
+      return res.json({
+        ok: true,
+        rates: result.rows
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load call rates."
+      );
+    }
+  }
+);
+
+app.patch(
+  "/api/admin/rates/:id",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const {
+        provider_cost,
+        customer_rate,
+        pulse_seconds
+      } = req.body;
+
+      const result = await pool.query(
+        `
+        UPDATE call_rates
+        SET
+          provider_cost = COALESCE($1, provider_cost),
+          customer_rate = COALESCE($2, customer_rate),
+          pulse_seconds = COALESCE($3, pulse_seconds),
+          updated_at = NOW()
+        WHERE id = $4
+        RETURNING *
+        `,
+        [
+          provider_cost ?? null,
+          customer_rate ?? null,
+          pulse_seconds ?? null,
+          req.params.id
+        ]
+      );
+
+      if (!result.rows.length) {
+        return sendError(
+          res,
+          404,
+          "Call rate not found."
+        );
+      }
+
+      await writeAudit({
+        adminId: req.auth.id,
+        action: "call_rate_updated",
+        targetType: "call_rate",
+        targetId: req.params.id,
+        details: req.body
+      });
+
+      return res.json({
+        ok: true,
+        rate: result.rows[0]
+      });
+    } catch (error) {
+      console.error("Rate update:", error);
+
+      return sendError(
+        res,
+        500,
+        "Unable to update call rate."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   AUDIT LOG
+========================================================= */
+
+app.get(
+  "/api/admin/audit-logs",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT
+          al.*,
+          ma.username AS admin_username
+        FROM audit_logs al
+        LEFT JOIN master_admins ma
+          ON ma.id = al.admin_id
+        ORDER BY al.created_at DESC
+        LIMIT 300
+        `
+      );
+
+      return res.json({
+        ok: true,
+        logs: result.rows
+      });
+    } catch (error) {
+      return sendError(
+        res,
+        500,
+        "Unable to load audit logs."
+      );
+    }
+  }
+);
+
+/* =========================================================
+   SAFE PLACEHOLDER ENDPOINTS
+   No fake data is returned.
+========================================================= */
+
+app.get(
+  "/api/admin/gateways",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
     return res.json({
       ok: true,
-      profile: {
-        id: db.masterAdmin.id,
-        email: db.masterAdmin.email,
-        role: db.masterAdmin.role,
-        createdAt: db.masterAdmin.createdAt,
-        updatedAt: db.masterAdmin.updatedAt,
-        lastLoginAt: db.masterAdmin.lastLoginAt
-      },
-      requestId: req.requestId
+      gateways: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/live-calls",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      calls: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/sms",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      provider: null,
+      todayCount: 0,
+      todayCost: 0,
+      messages: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/support",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      tickets: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/subadmins",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      subAdmins: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/apps",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      apps: []
+    });
+  }
+);
+
+app.get(
+  "/api/admin/analytics",
+  requireAuth,
+  requireMasterAdmin,
+  async (req, res) => {
+    return res.json({
+      ok: true,
+      data: []
     });
   }
 );
@@ -1018,48 +1825,71 @@ app.get(
 app.use((req, res) => {
   return res.status(404).json({
     ok: false,
-    message: "API endpoint not found.",
-    path: req.originalUrl,
+    error: "API route not found.",
+    path: req.path,
     requestId: req.requestId
   });
 });
 
 /* =========================================================
-   GLOBAL ERROR HANDLER
+   ERROR HANDLER
 ========================================================= */
 
 app.use((err, req, res, next) => {
-  console.error("GLOBAL ERROR:", err);
+  console.error("Unhandled error:", err);
 
-  if (res.headersSent) {
-    return next(err);
+  if (err.message === "CORS origin not allowed") {
+    return sendError(res, 403, "CORS origin not allowed.");
   }
 
-  return res.status(500).json({
-    ok: false,
-    message: "Internal server error.",
-    requestId: req.requestId
-  });
+  return sendError(
+    res,
+    500,
+    "Internal server error."
+  );
 });
 
 /* =========================================================
    START SERVER
 ========================================================= */
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Talkify Global Network Backend running on port ${PORT}`
-  );
+async function startServer() {
+  try {
+    await pool.query("SELECT 1");
 
-  console.log(
-    `Environment: ${NODE_ENV}`
-  );
+    console.log("Database connection successful.");
 
-  console.log(
-    `Configured frontend origins: ${
-      configuredOrigins.length
-        ? configuredOrigins.join(", ")
-        : "(development dynamic origin mode)"
-    }`
-  );
+    app.listen(PORT, () => {
+      console.log(
+        `Talkify Global Network backend running on port ${PORT}`
+      );
+
+      console.log(`Environment: ${NODE_ENV}`);
+    });
+  } catch (error) {
+    console.error(
+      "Database connection failed:",
+      error.message
+    );
+
+    process.exit(1);
+  }
+}
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received. Closing database...");
+
+  await pool.end();
+
+  process.exit(0);
 });
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT received. Closing database...");
+
+  await pool.end();
+
+  process.exit(0);
+});
+
+startServer();
