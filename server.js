@@ -1,3 +1,4 @@
+
 'use strict';
 
 /*
@@ -41,6 +42,29 @@ const COOKIE_NAME = 'talkify_session';
 
 const REQUEST_TIMEOUT_MS = 15000;
 const DB_CONNECT_TIMEOUT_MS = 8000;
+
+/* =========================================================
+   SAFE DATABASE CONFIG DIAGNOSTICS
+   Never log the password or complete DATABASE_URL.
+========================================================= */
+
+try {
+  if (DATABASE_URL) {
+    const dbUrl = new URL(DATABASE_URL);
+
+    console.log('[DATABASE CONFIG]', {
+      protocol: dbUrl.protocol,
+      username: decodeURIComponent(dbUrl.username),
+      hostname: dbUrl.hostname,
+      port: dbUrl.port || '(default)',
+      database: dbUrl.pathname
+    });
+  } else {
+    console.log('[DATABASE CONFIG] DATABASE_URL is missing.');
+  }
+} catch (error) {
+  console.error('[DATABASE CONFIG] Invalid DATABASE_URL format.');
+}
 
 /* =========================================================
    BASIC VALIDATION
@@ -801,10 +825,6 @@ app.post(
       return jsonError(res, 400, 'Phone number is required.');
     }
 
-    /*
-     * Real SMS provider must be connected here.
-     * We deliberately do NOT fake OTP delivery.
-     */
     return res.status(501).json({
       ok: false,
       error: 'OTP provider is not configured yet.',
@@ -992,10 +1012,6 @@ app.post(
   requireAuth,
   requireDatabase,
   asyncHandler(async (req, res) => {
-    /*
-     * Real face-match provider must be connected.
-     * No fake green verification.
-     */
     return res.status(501).json({
       ok: false,
       error: 'Face verification provider is not configured yet.',
@@ -1024,10 +1040,6 @@ app.post(
       );
     }
 
-    /*
-     * Actual image/object-storage upload and face verification
-     * must be connected before approval.
-     */
     return res.status(501).json({
       ok: false,
       error: 'KYC storage/verification provider is not configured yet.',
@@ -1631,10 +1643,6 @@ app.get(
   requireMasterAdmin,
   requireDatabase,
   asyncHandler(async (req, res) => {
-    /*
-     * Real provider integration will populate live call data.
-     * Never invent active calls.
-     */
     res.json({
       ok: true,
       calls: [],
@@ -1847,15 +1855,6 @@ app.use((error, req, res, next) => {
 /* =========================================================
    START SERVER
 ========================================================= */
-
-/*
- * IMPORTANT:
- * The HTTP server starts FIRST.
- * Database connection happens in the background.
- *
- * This prevents Render from waiting for PostgreSQL
- * before detecting the service port.
- */
 
 const server = app.listen(
   PORT,
