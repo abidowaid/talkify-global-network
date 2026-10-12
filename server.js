@@ -23,8 +23,7 @@ app.use(cors({origin:(process.env.ADMIN_ORIGIN||'').split(',').filter(Boolean),c
 app.use(express.json({limit:'1mb'}));
 app.use(rateLimit({windowMs:15*60*1000,limit:300,standardHeaders:true,legacyHeaders:false}));
 const cookieSecure=String(process.env.COOKIE_SECURE||'true')==='true';
-if(!cookieSecure) console.warn('COOKIE_SECURE=false: cross-site admin sessions may not work in modern browsers. Use HTTPS and COOKIE_SECURE=true.');
-app.use(session({store:DATABASE_URL?new PgSession({pool,tableName:'talkify_sessions',createTableIfMissing:true}):undefined,secret:process.env.SESSION_SECRET||'CHANGE_THIS_LONG_RANDOM_SECRET_BEFORE_DEPLOYMENT',resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'none',secure:cookieSecure,maxAge:8*60*60*1000}}));
+app.use(session({store:DATABASE_URL?new PgSession({pool,tableName:'talkify_sessions',createTableIfMissing:true}):undefined,secret:process.env.SESSION_SECRET||'CHANGE_THIS_LONG_RANDOM_SECRET_BEFORE_DEPLOYMENT',resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax',secure:cookieSecure,maxAge:8*60*60*1000}}));
 async function initDb(){
  await pool.query(`CREATE TABLE IF NOT EXISTS admins(id BIGSERIAL PRIMARY KEY,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'master_admin',active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
  CREATE TABLE IF NOT EXISTS feature_catalog(id INTEGER PRIMARY KEY,name TEXT NOT NULL,group_name TEXT NOT NULL,enabled BOOLEAN NOT NULL DEFAULT TRUE,updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
@@ -54,18 +53,6 @@ function requireFeature(featureId, action='view'){
 }
 async function audit(req,action,target='',details={}){await pool.query('INSERT INTO audit_logs(admin_id,action,target,details,ip) VALUES($1,$2,$3,$4,$5)',[req.session?.adminId||null,action,target,JSON.stringify(details),req.ip]);}
 app.get('/health',asyncRoute(async(req,res)=>{let db='ok';try{await pool.query('SELECT 1')}catch{db='error'}res.status(db==='ok'?200:503).json({ok:db==='ok',service:'Talkify Global Network',database:db,features:FEATURES.length});}));
-// Admin HTML uses this endpoint to check whether the first Master Admin is needed.
-app.get('/api/admin/setup-status',asyncRoute(async(req,res)=>{
-  const result=await pool.query(
-    'SELECT EXISTS(SELECT 1 FROM admins) AS exists'
-  );
-
-  res.json({
-    ok:true,
-    setupRequired:!result.rows[0].exists
-  });
-}));
-
 app.get('/api/admin/session',asyncRoute(async(req,res)=>{if(!req.session?.adminId)return res.json({authenticated:false});const q=await pool.query('SELECT id,email,role FROM admins WHERE id=$1 AND active=true',[req.session.adminId]);if(!q.rowCount){req.session.destroy(()=>{});return res.json({authenticated:false})}res.json({authenticated:true,admin:q.rows[0]});}));
 app.post('/api/admin/setup',asyncRoute(async(req,res)=>{const {email,password}=req.body||{};if(!email||!/^\S+@\S+\.\S+$/.test(email)||typeof password!=='string'||password.length<12)return res.status(400).json({message:'Valid email and password (12+ characters) required'});const count=await pool.query('SELECT count(*)::int n FROM admins');if(count.rows[0].n>0)return res.status(403).json({message:'Initial setup is closed. Ask an existing Master Admin.'});const hash=await bcrypt.hash(password,12);const q=await pool.query("INSERT INTO admins(email,password_hash,role) VALUES($1,$2,'master_admin') RETURNING id,email,role",[email.toLowerCase(),hash]);req.session.adminId=q.rows[0].id;req.session.role='master_admin';await audit(req,'master_admin_created','admin',{email:email.toLowerCase()});res.status(201).json({ok:true,admin:q.rows[0]});}));
 app.post('/api/admin/login',asyncRoute(async(req,res)=>{const {email,password}=req.body||{};const q=await pool.query('SELECT id,email,password_hash,role,active FROM admins WHERE lower(email)=lower($1)',[String(email||'')]);const a=q.rows[0];if(!a||!a.active||!await bcrypt.compare(String(password||''),a.password_hash))return res.status(401).json({message:'Invalid credentials'});req.session.regenerate(err=>{if(err)return res.status(500).json({message:'Session could not be created'});req.session.adminId=a.id;req.session.role=a.role;req.session.save(async e=>{if(e)return res.status(500).json({message:'Session could not be saved'});try{await audit(req,'admin_login','admin',{email:a.email});}catch{}res.json({ok:true,admin:{id:a.id,email:a.email,role:a.role}})})});}));
@@ -95,5 +82,11 @@ app.get('/api/admin/support/queue',requireAdmin,requireFeature(15,'view'),(req,r
 app.post('/api/admin/emergency-lock',requireMaster,asyncRoute(async(req,res)=>{await pool.query("INSERT INTO app_settings(key,value) VALUES('emergency_global_lock','true'::jsonb) ON CONFLICT(key) DO UPDATE SET value='true'::jsonb,updated_at=now()");await audit(req,'emergency_global_lock_enabled','system');res.json({ok:true,locked:true})}));
 app.get('/api/admin/settings/:key',requireAdmin,requireFeature(1,'view'),asyncRoute(async(req,res)=>{const q=await pool.query('SELECT value FROM app_settings WHERE key=$1',[req.params.key]);res.json({key:req.params.key,value:q.rows[0]?.value??null});}));
 app.put('/api/admin/settings/:key',requireMaster,asyncRoute(async(req,res)=>{await pool.query('INSERT INTO app_settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()',[req.params.key,JSON.stringify(req.body?.value??null)]);await audit(req,'setting_updated',req.params.key,{});res.json({ok:true});}));
+// Serve the Admin Portal from the same HTTPS origin as the API. This avoids
+// third-party-cookie blocking when the portal is opened from SPCK file preview.
+const path=require('path');
+app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'talkify-admin.index.html')));
+app.get('/talkify-admin.index.html',(req,res)=>res.sendFile(path.join(__dirname,'talkify-admin.index.html')));
+app.get('/dashboard.html',(req,res)=>res.sendFile(path.join(__dirname,'dashboard.html')));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({ok:false,message:process.env.NODE_ENV==='production'?'Internal server error':err.message||'Internal server error'});});
 initDb().then(()=>app.listen(PORT,()=>console.log(`Talkify server listening on ${PORT}`))).catch(e=>{console.error('Database initialization failed:',e.message);process.exit(1)});
